@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>codex-to-agents · Agents</title>
+  <style>
+    :root{color-scheme:light dark;--bg:#f7f8f5;--panel:#fff;--line:#e2e6df;--text:#263029;--muted:#7b857d;--green:#46734d}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    main{max-width:760px;margin:auto;padding:32px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}h1{margin:0;font-size:19px;font-weight:600;letter-spacing:-.4px}.connection{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;white-space:nowrap}.dot{width:6px;height:6px;background:var(--muted);border-radius:50%}.dot.online{background:var(--green)}
+    .agents{display:grid;gap:12px}.agent{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}.agent-head{display:flex;align-items:center;justify-content:space-between;gap:16px}.model{font-weight:600;overflow-wrap:anywhere}.status{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.status.running{color:var(--green)}.task{margin:8px 0 0;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.empty,.notice{font-size:13px;color:var(--muted)}.empty{padding:28px 0}.notice{margin:0 0 16px}.hidden{display:none}
+    @media(max-width:480px){main{padding:22px 16px}h1{font-size:17px}.agent{padding:16px}}
+    @media(prefers-color-scheme:dark){:root{--bg:#141714;--panel:#1b201c;--line:#303830;--text:#e5ebe5;--muted:#929e94;--green:#a4c99e}}
+  </style>
+  <script src="/monitor-client.js" defer></script>
+</head>
+<body><main>
+  <header><h1>codex-to-agents</h1><div class="connection"><i id="online-dot" class="dot"></i><span id="online-label">连接中</span></div></header>
+  <p id="notice" class="notice hidden" role="status"></p>
+  <div id="agents" class="agents" aria-label="Agent 状态"></div>
+</main></body>
+</html>
