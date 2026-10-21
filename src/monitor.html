@@ -8,6 +8,7 @@
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
     main{max-width:760px;margin:auto;padding:32px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}h1{margin:0;font-size:19px;font-weight:600;letter-spacing:-.4px}.connection{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;white-space:nowrap}.dot{width:6px;height:6px;background:var(--muted);border-radius:50%}.dot.online{background:var(--green)}
     .agents{display:grid;gap:12px}.agent{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}.agent-head{display:flex;align-items:center;justify-content:space-between;gap:16px}.model{font-weight:600;overflow-wrap:anywhere}.status{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap}.status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.status.running{color:var(--green)}.task{margin:8px 0 0;color:var(--muted);font-size:13px;overflow-wrap:anywhere}.empty,.notice{font-size:13px;color:var(--muted)}.empty{padding:28px 0}.notice{margin:0 0 16px}.hidden{display:none}
+    .settings{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:24px}.setting-row{display:flex;justify-content:space-between;align-items:center;gap:16px}.setting-title{font-weight:600;font-size:15px}.setting-help{color:var(--muted);font-size:13px;margin:6px 0 16px}.switch{appearance:none;position:relative;flex:none;width:44px;height:26px;margin:0;background:var(--line);border:1px solid var(--muted);border-radius:20px;cursor:pointer}.switch:before{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;background:var(--panel);border-radius:50%;box-shadow:0 1px 3px #0003;transition:transform .15s}.switch:checked{background:var(--green);border-color:var(--green)}.switch:checked:before{transform:translateX(18px)}.switch:focus-visible,select:focus-visible{outline:2px solid var(--green);outline-offset:3px}.switch:disabled{opacity:.5;cursor:wait}.executor{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--muted)}select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 10px;font:inherit}.setting-message{margin:12px 0 0;color:var(--muted);font-size:12px}.section-title{font-size:13px;color:var(--muted);font-weight:500;margin:0 0 12px}.summary{font-size:12px;color:var(--muted);margin:0 0 16px}.orders{margin-top:28px}.order{padding:12px 0;border-bottom:1px solid var(--line)}.order-head{display:flex;justify-content:space-between;gap:16px}.order-title{overflow-wrap:anywhere}.order-detail{margin:4px 0 0;color:var(--muted);font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
     @media(max-width:480px){main{padding:22px 16px}h1{font-size:17px}.agent{padding:16px}}
     @media(prefers-color-scheme:dark){:root{--bg:#141714;--panel:#1b201c;--line:#303830;--text:#e5ebe5;--muted:#929e94;--green:#a4c99e}}
   </style>
@@ -15,7 +16,17 @@
 </head>
 <body><main>
   <header><h1>codex-to-agents</h1><div class="connection"><i id="online-dot" class="dot"></i><span id="online-label">连接中</span></div></header>
+  <section class="settings" aria-label="派工设置">
+    <div class="setting-row"><label class="setting-title" for="delegation-switch">自动派工 <span id="delegation-state">已关闭</span></label><input id="delegation-switch" class="switch" type="checkbox" role="switch" aria-label="自动派工" disabled></div>
+    <p class="setting-help">开启后，Codex 将具体编程任务交给所选 Agent，负责拆解、跟进和验收。</p>
+    <label class="executor" for="delegation-executor">执行端 <select id="delegation-executor" disabled><option value="hermes">Hermes</option><option value="dsh">DSH</option></select></label>
+    <p id="delegation-message" class="setting-message" role="status">从下一条消息生效，关闭不会取消已提交的任务。</p>
+  </section>
   <p id="notice" class="notice hidden" role="status"></p>
+  <h2 class="section-title">Agents</h2>
+  <p id="summary" class="summary"></p>
   <div id="agents" class="agents" aria-label="Agent 状态"></div>
+  <section class="orders" aria-label="最近任务"><h2 class="section-title">最近任务</h2><div id="orders"></div></section>
+  <p id="service-info" class="setting-message" aria-label="后台进程"></p>
 </main></body>
 </html>

@@ -3,8 +3,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { OrderBook, TERMINAL } from './orders.mjs';
 
-async function lease(home) {
-  const file = join(home, 'consumer.lock');
+async function lease(home, executor) {
+  const file = join(home, executor === 'dsh' ? 'consumer.lock' : 'consumer-hermes.lock');
   const identity = { pid: process.pid, nonce: randomUUID() };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -16,7 +16,10 @@ async function lease(home) {
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const current = JSON.parse(await readFile(file, 'utf8'));
-      try { process.kill(current.pid, 0);throw new Error('Another work-order consumer owns this directory.'); }
+      try {
+        process.kill(current.pid, 0);
+        throw Object.assign(new Error('Another work-order consumer owns this directory for this executor.'), { code: 'CONSUMER_BUSY' });
+      }
       catch (probe) { if (probe.code !== 'ESRCH') throw probe; }
       await unlink(file);
     }
@@ -25,7 +28,9 @@ async function lease(home) {
 }
 
 export class Consumer {
-  constructor(home, desktop) {
+  constructor(home, desktop, { executor = 'dsh' } = {}) {
+    if (!['dsh', 'hermes'].includes(executor)) throw new Error('Unknown executor.');
+    this.executor = executor;
     this.book = new OrderBook(home);
     this.desktop = desktop;
     this.tail = Promise.resolve();
@@ -38,13 +43,15 @@ export class Consumer {
     await this.book.open();
     const stat = await lstat(this.book.home);
     if (stat.isSymbolicLink()) throw new Error('Work-order directory may not be a symlink.');
-    this.release = await lease(this.book.home);
+    this.release = await lease(this.book.home, this.executor);
     // A process may have died after a side effect but before saving its reply.
     // Mark those orders uncertain; never automatically submit them again.
     try {
+      await this.desktop.open?.();
       for (const state of await this.book.list()) {
+        if (state.executor !== this.executor) continue;
         if (state.status === 'dispatching') await this.book.transition(state.order_id, 'uncertain', {
-          conversation_id: state.conversation_id ?? (state.kind === 'work_submit' ? `cw-${state.order_id}` : undefined),
+          conversation_id: state.conversation_id ?? (this.executor === 'dsh' && state.kind === 'work_submit' ? `cw-${state.order_id}` : undefined),
           progress: 'Consumer restarted during dispatch; inspecting native history instead of replaying.',
         });
       }
@@ -62,9 +69,14 @@ export class Consumer {
       catch (error) { this.catalog = { error: error.message }; }
       this.nextCatalog = Date.now() + 15000;
     }
-    const orders = await this.book.list();
-    const sessions = this.desktop.observe(orders.map(order => order.conversation_id).filter(Boolean));
-    await this.book.runtime({ active: true, at: new Date().toISOString(), pid: process.pid, catalog: this.catalog, sessions });
+    const orders = (await this.book.list()).filter(order => order.executor === this.executor);
+    let sessions;
+    try { sessions = await this.desktop.observe(orders.map(order => order.conversation_id).filter(Boolean)); }
+    catch (error) {
+      await this.book.runtime({ protocol: 2, executor: this.executor, active: false, at: new Date().toISOString(), pid: process.pid, catalog: { error: error.message }, sessions: [] }, this.executor);
+      return;
+    }
+    await this.book.runtime({ protocol: 2, executor: this.executor, active: true, at: new Date().toISOString(), pid: process.pid, catalog: this.catalog, sessions }, this.executor);
     for (const state of orders) {
       if (TERMINAL.has(state.status)) continue;
       const order = await this.book.request(state.order_id);
@@ -98,24 +110,29 @@ export class Consumer {
         }
         location = { conversation_id: target.conversation_id };
       }
+      const sessionId = location?.conversation_id ?? input.conversation_id;
+      if (order.kind === 'work_update' && input.action === 'append' && this.desktop.ready) {
+        const siblings = (await this.book.list()).filter(state => state.order_id !== order.id
+          && state.executor === this.executor && state.conversation_id === sessionId && !TERMINAL.has(state.status));
+        if (siblings.length || !await this.desktop.ready(sessionId)) return;
+      }
       await this.book.transition(order.id, 'dispatching');
       if (order.kind === 'work_submit') {
         location = await this.desktop.start(order);
         await this.book.transition(order.id, 'dispatching', location);
         startedDelivery = true;
-        await this.desktop.send(order, location, input.goal, 'queue');
-        await this.book.transition(order.id, 'executing', { progress: 'Message submitted to DSH.' });
+        const receipt = await this.desktop.send(order, location, input.goal, 'queue');
+        await this.book.transition(order.id, receipt?.status ?? 'executing', receipt ?? { progress: `Message submitted to ${this.executor}.` });
       } else if (order.kind === 'work_update') {
-        const sessionId = location?.conversation_id ?? input.conversation_id;
         if (input.action === 'cancel') {
-          await this.desktop.cancel(sessionId);
-          await this.book.transition(order.id, 'completed', { output: { cancellation_requested: true, conversation_id: sessionId, queued_messages_retained: true } });
+          const receipt = await this.desktop.cancel(sessionId);
+          await this.book.transition(order.id, 'completed', { output: { cancellation_requested: true, conversation_id: sessionId, queued_messages_retained: true, ...receipt } });
         } else {
           location = await this.desktop.checkpoint(sessionId);
           await this.book.transition(order.id, 'dispatching', location);
           startedDelivery = true;
-          await this.desktop.send(order, location, input.message, input.action === 'interrupt' ? 'steer' : 'queue');
-          await this.book.transition(order.id, 'executing', { progress: 'Follow-up submitted to DSH.' });
+          const receipt = await this.desktop.send(order, location, input.message, input.action === 'interrupt' ? 'steer' : 'queue');
+          await this.book.transition(order.id, receipt?.status ?? 'executing', receipt ?? { progress: `Follow-up submitted to ${this.executor}.` });
         }
       } else {
         const output = order.kind === 'workspace_control' ? await this.desktop.workspaceAction(input)
@@ -123,8 +140,9 @@ export class Consumer {
         await this.book.transition(order.id, 'completed', { output });
       }
     } catch (error) {
-      await this.book.transition(order.id, startedDelivery ? 'uncertain' : 'failed', {
-        error: error.message, progress: startedDelivery ? 'Submission outcome is uncertain; automatic replay is disabled.' : error.message,
+      const uncertain = error.deliveryUnknown || startedDelivery && !error.definite;
+      await this.book.transition(order.id, uncertain ? 'uncertain' : 'failed', {
+        error: error.message, progress: uncertain ? 'Submission outcome is uncertain; automatic replay is disabled.' : error.message,
       });
     }
   }
@@ -134,8 +152,10 @@ export class Consumer {
       this.closed = true;
       this.closing = (async () => {
         await this.tail.catch(() => {});
-        await this.book.runtime({ active: false, at: new Date().toISOString(), catalog: this.catalog });
-        await this.release?.();
+        try {
+          await this.desktop.close?.();
+          await this.book.runtime({ protocol: 2, executor: this.executor, active: false, at: new Date().toISOString(), catalog: this.catalog }, this.executor);
+        } finally { await this.release?.(); }
       })();
     }
     return this.closing;

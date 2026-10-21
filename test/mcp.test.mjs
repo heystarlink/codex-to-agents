@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { OrderBook } from '../src/orders.mjs';
+import { stopBackend } from '../src/backend-control.mjs';
 
 test('real MCP stdio supports offline orders and reading independently saved results', async () => {
   const home = await mkdtemp('/tmp/cw-mcp-');
@@ -19,5 +20,5 @@ test('real MCP stdio supports offline orders and reading independently saved res
     const book = new OrderBook(home);await book.transition(id, 'completed', { output: { text: 'verified result' } });
     const result = await client.callTool({ name: 'work_inspect', arguments: { order_id: id } });
     assert.equal(result.structuredContent.output.text, 'verified result');
-  } finally { await client.close();await rm(home, { recursive: true, force: true }); }
+  } finally { await client.close();await stopBackend(home);await rm(home, { recursive: true, force: true }); }
 });

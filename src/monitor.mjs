@@ -2,6 +2,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
 import { OrderBook } from './orders.mjs';
+import { readDelegation } from './delegation.mjs';
 
 export const ACTIVE = new Set(['queued', 'dispatching', 'executing']);
 export const PROBLEMS = new Set(['failed', 'blocked', 'uncertain']);
@@ -23,15 +24,24 @@ export function elapsed(milliseconds) {
 }
 
 // This projection is read-only. Opening a monitor never creates the data folder,
-// publishes work, wakes DSH, or changes a task's state.
+// publishes work, wakes an execution agent, or changes a task's state.
 export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {}) {
   const book = new OrderBook(home);
   const warnings = [];
-  let runtime = { online: false, snapshot: null };
-  try { runtime = await book.runtime(); }
-  catch (error) { warnings.push(`运行快照读取失败：${error.message}`); }
-  // Use one timestamp throughout the projection, including staleness checks.
-  runtime.online = Boolean(runtime.snapshot?.active && now - (epoch(runtime.snapshot.at) ?? 0) < 6000);
+  let delegation;
+  try { delegation = await readDelegation(home); }
+  catch { delegation = { enabled: false, executor: 'hermes', error: '自动派工设置读取失败，请重新保存开关。' };warnings.push(delegation.error); }
+  const executors = {};
+  for (const name of ['dsh', 'hermes']) {
+    let runtime = { online: false, snapshot: null };
+    try { runtime = await book.runtime(null, name); }
+    catch (error) { warnings.push(`${name} 运行快照读取失败：${error.message}`); }
+    runtime.online = Boolean(runtime.snapshot?.active && now - (epoch(runtime.snapshot.at) ?? 0) < 6000);
+    executors[name] = runtime;
+  }
+  const online = Object.values(executors).some(runtime => runtime.online);
+  const latest = Object.values(executors).map(runtime => runtime.snapshot).filter(Boolean)
+    .sort((a, b) => (epoch(b.at) ?? 0) - (epoch(a.at) ?? 0))[0];
   let files = [];
   try { files = await readdir(book.requests); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -47,7 +57,7 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
       model: state.route?.model ?? input.model ?? null, provider: state.route?.provider ?? input.provider ?? null,
       directory: state.directory ?? input.directory ?? null,
       elapsed_ms: Math.max(0, end - start),
-      stale: !runtime.online && ACTIVE.has(state.status),
+      stale: !executors[state.executor].online && ACTIVE.has(state.status),
     };
   }));
   const orders = [];
@@ -63,26 +73,31 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
     else if (PROBLEMS.has(order.status)) summary.problems++;
     else if (order.status === 'cancelled') summary.cancelled++;
   }
-  const live = new Map((runtime.snapshot?.sessions ?? []).map(session => [session.id, session.status]));
+  const live = new Map(Object.entries(executors).flatMap(([name, runtime]) =>
+    (runtime.snapshot?.sessions ?? []).map(session => [`${name}:${session.id}`, session.status])));
   const grouped = new Map();
   for (const order of orders) {
     if (!order.conversation_id) continue;
-    let agent = grouped.get(order.conversation_id);
+    const key = `${order.executor}:${order.conversation_id}`;
+    const connected = executors[order.executor].online;
+    let agent = grouped.get(key);
     if (!agent) {
-      agent = { id: order.conversation_id, model: null, provider: null, order_count: 0,
-        status: runtime.online ? live.get(order.conversation_id) ?? 'unknown' : 'unknown',
-        stale: !runtime.online, latest_order: order.order_id, latest_title: order.title, latest_task_status: order.status };
-      grouped.set(agent.id, agent);
+      agent = { id: order.conversation_id, executor: order.executor, model: null, provider: null, order_count: 0,
+        status: connected ? live.get(key) ?? 'unknown' : 'unknown',
+        stale: !connected, latest_order: order.order_id, latest_title: order.title, latest_task_status: order.status };
+      grouped.set(key, agent);
     }
     agent.order_count++;
     agent.model ??= order.model;agent.provider ??= order.provider;
   }
   return {
-    generated_at: new Date(now).toISOString(), home,
-    worker: { online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
-      heartbeat_age_ms: runtime.snapshot ? Math.max(0, now - (epoch(runtime.snapshot.at) ?? 0)) : null,
-      pid: runtime.snapshot?.pid ?? null, live_sessions_available: Array.isArray(runtime.snapshot?.sessions),
-      catalog_error: runtime.snapshot?.catalog?.error ?? null },
+    generated_at: new Date(now).toISOString(), home, delegation,
+    service: { pid: process.pid, name: process.title, rss_mib: Math.round(process.memoryUsage.rss() / 1024 / 1024) },
+    worker: { online, last_seen: latest?.at ?? null,
+      heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,
+      pid: latest?.pid ?? null, live_sessions_available: Object.values(executors).some(runtime => Array.isArray(runtime.snapshot?.sessions)),
+      catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
+      executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, { online: runtime.online, last_seen: runtime.snapshot?.at ?? null }])) },
     summary, agents: [...grouped.values()], orders: orders.slice(0, limit), warnings,
   };
 }
@@ -120,7 +135,7 @@ export function renderTerminal(snapshot, { width = 110, height = 35, selected = 
   add('');add(`Agent 执行会话 (${snapshot.agents.length})`);
   if (!snapshot.agents.length) add('暂无执行会话。派发任务后会自动显示。');
   for (const agent of snapshot.agents.slice(0, 4)) {
-    add(`  ${agent.id.slice(0, 15)}  ${agent.model ?? '—'}  ${LABELS[agent.status] ?? agent.status}${agent.stale ? '（离线，状态未知）' : ''}`);
+    add(`  ${agent.executor} · ${agent.id.slice(0, 15)}  ${agent.model ?? '—'}  ${LABELS[agent.status] ?? agent.status}${agent.stale ? '（离线，状态未知）' : ''}`);
   }
   if (snapshot.agents.length > 4) add(`  另有 ${snapshot.agents.length - 4} 个会话，网页看板可查看全部。`);
   if (snapshot.worker.online && !snapshot.worker.live_sessions_available && snapshot.agents.length) add('当前消费者尚未提供实时会话快照；重载 DSH 插件后可查看。');

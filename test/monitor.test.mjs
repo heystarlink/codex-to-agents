@@ -66,6 +66,22 @@ test('terminal output strips injected control sequences and shows offline execut
   assert.ok(text.includes('未知'));assert.ok(text.includes('q 退出'));
 });
 
+test('monitor separates identical session IDs and freshness across DSH and Hermes', async t => {
+  const { book, home } = await fixture(t);
+  const dsh = await book.submit('work_submit', { goal: 'DSH work' });
+  const hermes = await book.submit('work_submit', { executor: 'hermes', goal: 'Hermes work' });
+  for (const order of [dsh, hermes]) await book.transition(order.order_id, 'executing', { conversation_id: 'same-id' });
+  const now = Date.now();
+  await book.runtime({ active: true, at: new Date(now - 7000).toISOString(), sessions: [{ id: 'same-id', status: 'running' }] });
+  await book.runtime({ active: true, at: new Date(now).toISOString(), sessions: [{ id: 'same-id', status: 'idle' }] }, 'hermes');
+  const view = await monitorSnapshot(home, { now });
+  assert.equal(view.worker.online, true);assert.equal(view.agents.length, 2);
+  assert.equal(view.agents.find(agent => agent.executor === 'dsh').status, 'unknown');
+  assert.equal(view.agents.find(agent => agent.executor === 'hermes').status, 'idle');
+  assert.equal(view.orders.find(order => order.executor === 'dsh').stale, true);
+  assert.equal(view.orders.find(order => order.executor === 'hermes').stale, false);
+});
+
 test('web monitor serves the real snapshot but rejects write requests, traversal and foreign hosts', async t => {
   const { home, book } = await fixture(t);
   await book.submit('work_submit', { goal: '<script>untrusted</script>', title: 'A real row' });
