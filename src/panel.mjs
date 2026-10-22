@@ -3,10 +3,37 @@ import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
 import { delegationSchema, saveDelegation, readDelegation } from './delegation.mjs';
 
-export const PANEL_URI = 'ui://codex-to-agents/board/v1';
+export const PANEL_URI = 'ui://codex-to-agents/board/v2';
+// Old board pages predate the workspace fence: they send document actions with
+// a code `directory` and no workspace_id. Such a request has no root identity,
+// so it cannot be upgraded or executed safely (another board may already have
+// switched workspaces). Reject it at the boundary with one readable message
+// before touching storage or loading the SDD module.
+const LEGACY_BOARD_ACTIONS = new Set(['list_projects', 'register_project', 'list_tasks', 'create_task', 'read_task', 'save_task']);
+const LEGACY_BOARD_MESSAGE = '看板页面版本过旧，缺少工作区标识，无法执行文档操作。请关闭看板页面并重新打开以载入新版本。';
 const mimeType = 'text/html;profile=mcp-app';
 const ui = { prefersBorder: false, csp: {} };
 const result = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
+const sddProjectId = z.string().regex(/^[a-f0-9]{16}$/, '项目编号无效。');
+const sddTaskId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, '任务编号无效。');
+const sddWorkspaceId = z.string().regex(/^[a-f0-9]{16}$/, 'SDD 工作区标识无效，请重新读取工作区。');
+const sddTitle = z.string().trim().min(1).max(120);
+// The MCP SDK only publishes a JSON schema for object-shaped tool inputs. Keep
+// the public contract as a strict object and let the dynamically imported
+// sdd-workspace.mjs enforce the per-action discriminated union (required fields,
+// unknown keys, workspace fencing, path/ID formats) inside the handler.
+const sddSchema = z.object({
+  action: z.enum(['get_workspace', 'set_workspace', 'list_projects', 'register_project',
+    'list_tasks', 'create_task', 'read_task', 'save_task']),
+  workspace_id: sddWorkspaceId.optional(),
+  project_id: sddProjectId.optional(),
+  task_id: sddTaskId.optional(),
+  directory: z.string().trim().min(1).max(4096).optional(),
+  name: z.string().trim().min(1).max(120).optional(),
+  title: sddTitle.optional(),
+  content: z.string().optional(),
+  revision: z.string().regex(/^[a-f0-9]{64}$/, '文档版本无效，请重新读取。').optional(),
+}).strict();
 
 let builtHtml;
 export async function panelHtml() {
@@ -14,14 +41,15 @@ export async function panelHtml() {
 }
 
 async function buildHtml() {
-  const [html, bridge, client] = await Promise.all(['monitor.html', 'panel-bridge.js', 'monitor-client.js']
+  const [html, bridge, client, sdd] = await Promise.all(['monitor.html', 'panel-bridge.js', 'monitor-client.js', 'sdd-client.js']
     .map(name => readFile(new URL(name, import.meta.url), 'utf8')));
-  const script = (bridge + '\n' + client).replace(/<\/script/gi, '<\\/script');
+  const script = (bridge + '\n' + client + '\n' + sdd).replace(/<\/script/gi, '<\\/script');
   return html.replace('<script src="/monitor-client.js" defer></script>', `<script defer>${script}</script>`)
+    .replace('<script src="/sdd-client.js" defer></script>', '')
     .replace('<script defer>', '<script type="module">');
 }
 
-export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime } = {}) {
+export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel } = {}) {
   server.registerResource('agents-board', PANEL_URI, { title: 'Agents 看板', mimeType, _meta: { ui } }, async () => ({
     contents: [{ uri: PANEL_URI, mimeType, text: await panelHtml(), _meta: {
       ui, 'openai/ui': { availableDisplayModes: ['fullscreen'], preferredDisplayMode: 'fullscreen' },
@@ -35,6 +63,7 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
   for (const [name, description, schema, action] of [
     ['panel_snapshot', 'Read delegation preferences and available executor models. refresh_models loads the selected executor runtime without submitting work.',
       z.object({ executor: z.enum(['hermes', 'dsh']).optional(), refresh_models: z.boolean().optional() }).strict(), async ({ executor, refresh_models }) => {
+        Promise.resolve(onPanel?.()).catch(error => console.error(error.message));
         if (refresh_models) {
           // Keep the switch usable while a disconnected executor is starting.
           Promise.resolve(onRuntime?.(executor ?? (await readDelegation(home)).executor))
@@ -52,4 +81,23 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
     });
   }
+  // App-only SDD workspace. This is the board's write path for a shared
+  // document directory (home/sdd by default) and its task.md files; the
+  // read-only HTTP monitor never exposes it. Loading sdd-workspace.mjs is
+  // deferred until the user's first workspace/document action.
+  server.registerTool('panel_sdd', {
+    title: 'SDD 共享工作区',
+    description: 'Read or change the shared SDD document workspace selected by the user in the Agents board, and read or save one task.md inside it. App-only; the model cannot see or call it.',
+    inputSchema: sddSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },
+  }, async input => {
+    if (LEGACY_BOARD_ACTIONS.has(input.action) && input.workspace_id == null) {
+      return { isError: true, content: [{ type: 'text', text: LEGACY_BOARD_MESSAGE }] };
+    }
+    try {
+      const { runSddAction } = await import('./sdd-workspace.mjs');
+      return result(await runSddAction(home, input));
+    } catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
+  });
 }

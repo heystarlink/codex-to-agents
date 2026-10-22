@@ -105,3 +105,16 @@ test('desktop management uses the same work-order lifecycle and rejected operati
   await assert.rejects(f.book.submit('workspace_control', { action: 'register' }));
   await assert.rejects(f.book.inspect('../escape'), /Invalid/);
 });
+
+test('malformed order IDs are rejected with parameter and remedy before any request is saved', async t => {
+  const home = await mkdtemp('/tmp/cw-test-id-');
+  const book = new OrderBook(home);
+  t.after(async () => rm(home, { recursive: true, force: true }));
+  for (const order_id of ['my-task', 'cw-12345678-1234-4234-8234-123456789abc', 'not-a-uuid']) {
+    await assert.rejects(book.submit('work_submit', { order_id, goal: 'must not save' }),
+      /order_id must be a real UUID, not a task title, cw- conversation ID, or example placeholder/);
+  }
+  await book.open();
+  assert.deepEqual(await book.list(), []);
+  await assert.rejects(book.inspect('my-task'), /Invalid order_id/);
+});

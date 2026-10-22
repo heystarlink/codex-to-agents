@@ -70,6 +70,25 @@ test('an old polling response cannot revert a newly saved switch or hide a missi
   await poll();assert.equal($('delegation-switch').checked, false);
 });
 
+test('saved ON is pending while the hook is untrusted, and trust readiness never claims an old chat is loaded', async () => {
+  let activation = { status: 'untrusted' };let setting = { enabled: true, executor: 'dsh' };
+  const { $, poll } = await panelFixture(async (name, input) => {
+    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    return { delegation: setting, activation, worker: { executors: { dsh: { online: true, models: [] } } } };
+  });
+  assert.match($('delegation-state').textContent, /待生效/);
+  assert.match($('activation-message').textContent, /尚未生效.*\/hooks.*信任/);
+  assert.equal($('online-label').textContent, 'DSH 已连接');
+  $('delegation-switch').checked = false;$('delegation-switch').change();await settle();
+  $('delegation-switch').checked = true;$('delegation-switch').change();await settle();
+  assert.equal($('delegation-message').textContent, '设置已保存。');assert.match($('delegation-state').textContent, /待生效/);
+  activation = { status: 'ready' };await poll();
+  assert.equal($('delegation-state').textContent, '已开启');
+  assert.match($('activation-message').textContent, /Hook 已信任.*旧会话请先重新加载/);
+  activation = { status: 'unknown' };await poll();assert.match($('delegation-state').textContent, /未确认/);
+  assert.match($('activation-message').textContent, /不代表派工已生效/);
+});
+
 test('panel polling pauses when hidden or clipped, refreshes on return, and stops after teardown', async () => {
   const source = await readFile(new URL('../src/monitor-client.js', import.meta.url), 'utf8');
   const timers = new Map();const elements = new Map();const documentEvents = new Map();

@@ -36,7 +36,25 @@ function updateConnection() {
   const executor = $('delegation-executor').value;
   const online = Boolean(snapshot?.worker.executors[executor]?.online);
   $('online-dot').className = 'dot' + (online ? ' online' : '');
-  $('online-label').textContent = online ? '已连接' : '未连接';
+  $('online-label').textContent = `${executorName(executor)} ${online ? '已连接' : '未连接'}`;
+}
+
+function renderActivation() {
+  const status = snapshot?.activation?.status ?? 'unknown';
+  $('delegation-state').textContent = !currentSetting.enabled ? '已关闭' : status === 'ready' ? '已开启'
+    : status === 'checking' ? '已开启 · 检查中' : status === 'unknown' ? '已开启 · 未确认' : '已开启 · 待生效';
+  const messages = {
+    checking: '正在检查自动派工 Hook…',
+    untrusted: '尚未生效：在 Codex CLI 输入 /hooks，审核并信任 Agents 看板的 UserPromptSubmit Hook，再重新加载旧会话。',
+    modified: '尚未生效：自动派工 Hook 已更改。请在 Codex CLI 的 /hooks 中重新审核并信任，再重新加载旧会话。',
+    disabled: '尚未生效：自动派工 Hook 已停用，请在 Codex CLI 的 /hooks 中启用它，再重新加载旧会话。',
+    missing: '尚未生效：未检测到自动派工 Hook。请启用 Agents 看板插件，并重新加载会话。',
+    missing_installation: '无法检查 Hook：请按安装教程重新安装看板，并指定 Codex CLI 路径。',
+    ready: 'Hook 已信任。设置供已加载插件的会话在下一条消息使用；旧会话请先重新加载。',
+    unknown: '未能确认 Hook 状态。开关已保存不代表派工已生效，请在 Codex CLI 的 /hooks 中检查。',
+  };
+  $('activation-message').textContent = messages[status] ?? messages.unknown;
+  $('activation-message').className = 'activation-message' + (['ready', 'checking'].includes(status) ? '' : ' error');
 }
 
 function render(data, requestRevision) {
@@ -45,7 +63,6 @@ function render(data, requestRevision) {
     currentSetting = data.delegation;
     $('delegation-switch').checked = currentSetting.enabled;
     $('delegation-executor').value = currentSetting.executor;
-    $('delegation-state').textContent = currentSetting.enabled ? '已开启' : '已关闭';
     $('delegation-switch').disabled = $('delegation-executor').disabled = !window.agentsHost;
     renderModels();
     if (currentSetting.error) {
@@ -54,6 +71,7 @@ function render(data, requestRevision) {
     }
   }
   updateConnection();
+  renderActivation();
   if (!window.agentsHost) {
     $('delegation-message').textContent = '请在 Codex 的 Agents 看板中设置自动派工与模型。';
   }
@@ -72,7 +90,7 @@ async function saveSetting({ executorChanged = false } = {}) {
   try {
     currentSetting = await window.agentsHost.call('panel_settings', input);
     $('delegation-message').className = 'setting-message';
-    $('delegation-message').textContent = '已保存，从下一条消息生效。';
+    $('delegation-message').textContent = '设置已保存。';
   } catch (error) {
     $('delegation-message').className = 'setting-message error';
     $('delegation-message').textContent = '保存失败：' + error.message;
@@ -80,9 +98,8 @@ async function saveSetting({ executorChanged = false } = {}) {
     saving = false;
     $('delegation-switch').checked = currentSetting.enabled;
     $('delegation-executor').value = currentSetting.executor;
-    $('delegation-state').textContent = currentSetting.enabled ? '已开启' : '已关闭';
     $('delegation-switch').disabled = $('delegation-executor').disabled = stopped;
-    renderModels();updateConnection();
+    renderModels();updateConnection();renderActivation();
     if (executorChanged) { refreshModels = true; }
     void refresh();
   }

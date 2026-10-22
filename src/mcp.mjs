@@ -1,18 +1,18 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { OrderBook, definitions } from './orders.mjs';
+import { OrderBook, definitions, inspectOrderId } from './orders.mjs';
 import { readDelegation } from './delegation.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
 
-export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings } = {}) {
+export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings, onPanel } = {}) {
   const book = new OrderBook(home);
   await book.open();
   const server = new McpServer({ name: 'codex-to-agents', version: '0.1.0' });
   if (panelOnly) {
     const { registerPanel } = await import('./panel.mjs');
-    registerPanel(server, home, { snapshot, onSettings, onRuntime });
+    registerPanel(server, home, { snapshot, onSettings, onRuntime, onPanel });
     return server;
   }
   for (const [kind, definition] of Object.entries(definitions)) {
@@ -26,7 +26,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
   }
   server.registerTool('work_inspect', {
     description: 'Read a saved work order with executor, progress, conversation ID and output. Without order_id list recent work orders. Works while execution agents are offline.',
-    inputSchema: z.object({ order_id: z.uuid().optional(), limit: z.number().int().min(1).max(50).default(10) }).strict(),
+    inputSchema: z.object({ order_id: inspectOrderId, limit: z.number().int().min(1).max(50).default(10) }).strict(),
     annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ order_id, limit }) => {
     try {

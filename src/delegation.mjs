@@ -50,7 +50,7 @@ export async function delegationContext(home) {
   const modelPreference = setting.route
     ? '新建任务使用看板选定的提供方和模型，先确认它们仍在该执行端可用目录中；不可用时说明原因，不静默替换。'
     : '新建任务跟随执行端默认模型，本轮不沿用本会话之前的固定模型偏好。';
-  return `用户在 Agents 看板开启了自动派工，执行端为 ${setting.executor}。${modelPreference}对用户要求实施的编程、修复和测试任务，先分析和限定目录、文件范围及验收条件，再通过 codex-to-agents 的 runtime_info 检查该执行端，使用 work_submit（executor: "${setting.executor}"${modelArguments}）委派具体工作，并用 work_inspect 跟进、独立检查文件和验证结果；后续同任务使用 work_update，沿用原会话模型。只读问答、讨论和规划直接处理；用户明确要求自行执行或指定其他 agent、模型时遵从用户要求。不可扩大原任务权限，执行端离线或工具缺失时说明原因，不静默换端或盲目重复提交。每次新的自动派工前重新读取 ${JSON.stringify(join(home, 'delegation.json'))}，若已关闭则停止自动派发。不要自行修改开关。`;
+  return `用户在 Agents 看板开启了自动派工，执行端为 ${setting.executor}。${modelPreference}对用户要求实施的编程、修复和测试任务，先分析和限定目录、文件范围及验收条件，再通过 codex-to-agents 的 runtime_info 检查该执行端，使用 work_submit（executor: "${setting.executor}"${modelArguments}）委派具体工作，并用 work_inspect 跟进、独立检查文件和验证结果；后续同任务使用 work_update，沿用原会话模型。work_submit 的 order_id 可省略并由系统生成；若自行指定，必须在首次提交前用真实 UUID 生成器（例如 crypto.randomUUID()）生成，首次提交与不确定重试沿用同一个 order_id 和完全相同的参数；不得把任务名、cw- 会话 ID 或示例占位符当作 order_id。只读问答、讨论和规划直接处理；用户明确要求自行执行或指定其他 agent、模型时遵从用户要求。不可扩大原任务权限，执行端离线或工具缺失时说明原因，不静默换端或盲目重复提交。每次新的自动派工前重新读取 ${JSON.stringify(join(home, 'delegation.json'))}，若已关闭则停止自动派发。不要自行修改开关。`;
 }
 
 export async function runDelegationHook(home, input = process.stdin, output = process.stdout) {

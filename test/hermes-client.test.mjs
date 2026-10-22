@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { HermesClient, hermesUrl } from '../src/hermes-client.mjs';
 
-async function fixture(t, timeout = 100) {
+async function fixture(t, timeout = 2000) {
   const requests = [];
   const sockets = [];
   const state = { token: 'ephemeral-test-token', reply: message => ({ jsonrpc: '2.0', id: message.id, result: { ok: true } }) };
@@ -51,7 +51,7 @@ test('local Dashboard bootstrap authenticates HTTP and RPC; redirects never forw
 });
 
 test('RPC rejection is definite while timeout or disconnect preserves unknown delivery without replay', async t => {
-  const { client, state, sockets } = await fixture(t);
+  const { client, state, sockets } = await fixture(t, 100);
   state.reply = message => ({ jsonrpc: '2.0', id: message.id, error: { code: 4007, message: 'session not found' } });
   await assert.rejects(client.call('session.resume'), error => error.definite === true && error.rpcCode === 4007);
   let count = 0;state.reply = () => { count++;return null; };

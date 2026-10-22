@@ -30,7 +30,8 @@ test('concurrent startup and HTTP clients share one backend; connection close an
   };
   try {
     const [a, b, panel] = await Promise.all([connect('/mcp'), connect('/mcp'), connect('/board')]);
-    assert.equal((await a.listTools()).tools.length, 6);assert.equal((await panel.listTools()).tools.length, 3);
+    assert.equal((await a.listTools()).tools.length, 6);
+    assert.deepEqual((await panel.listTools()).tools.map(tool => tool.name).sort(), ['open_panel', 'panel_sdd', 'panel_settings', 'panel_snapshot']);
     const payload = { order_id: randomUUID(), goal: 'offline shared work' };
     const submitted = await Promise.all([a, b].map(client => client.callTool({ name: 'work_submit', arguments: payload })));
     assert.deepEqual(submitted.map(value => value.structuredContent.reused).sort(), [false, true]);

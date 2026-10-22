@@ -3,9 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { monitorSnapshot } from './monitor.mjs';
 
 export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
-  const [html, client] = await Promise.all([
+  const [html, client, sdd] = await Promise.all([
     readFile(new URL('./monitor.html', import.meta.url)),
     readFile(new URL('./monitor-client.js', import.meta.url)),
+    readFile(new URL('./sdd-client.js', import.meta.url)),
   ]);
   let address;
   const server = createServer(async (req, res) => {
@@ -24,6 +25,7 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
       const path = new URL(req.url, `http://${host}`).pathname;
       if (path === '/') res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(html);
       else if (path === '/monitor-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(client);
+      else if (path === '/sdd-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(sdd);
       else if (path === '/api/snapshot') {
         const snapshot = await monitorSnapshot(home, { limit });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }).end(JSON.stringify(snapshot));

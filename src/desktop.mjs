@@ -1,28 +1,61 @@
 import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 
+function claimedMessage(events, orderId) {
+  const inboxes = new Map();let claimed;
+  const matches = message => message.source?.rpcId === orderId;
+  for (const event of events) {
+    if (event.type !== 'agent/inbox/spliced') continue;
+    const data = event.data;
+    const queue = inboxes.get(data.target) ?? [];inboxes.set(data.target, queue);
+    const inserted = data.inserted ?? [];
+    const removed = queue.splice(data.start, data.removedCount ?? 0, ...inserted);
+    if (removed.some(matches)) claimed = event;
+    if (inserted.some(matches)) claimed = undefined;
+  }
+  return claimed;
+}
+
 // Only this adapter knows DSH service names. Queue and MCP code know work orders.
 export class Desktop {
   constructor(context, settings) {
     this.context = context;
     this.settings = settings;
-    this.routes = new Set(settings.providers);
+    const providers = settings.providers;
+    // "*" means whatever DSH currently has loaded; it cannot be narrowed with IDs.
+    if (providers.includes('*') && providers.length !== 1) {
+      throw new Error('Configure either "*" alone or explicit provider IDs, not both.');
+    }
+    this.everyProvider = providers.length === 1 && providers[0] === '*';
+    this.routes = new Set(this.everyProvider ? [] : providers);
     this.protectedAgents = new WeakSet();
+  }
+
+  // Loaded and allowlisted routes are the same live set for every entry point,
+  // so catalog, resolution, dispatch and follow-ups agree at every moment.
+  loadedProviders() {
+    return this.context.llm.listProviders().map(provider => provider.id);
   }
 
   async describe() {
     const llm = this.context.llm;
-    const loaded = new Set(llm.listProviders().map(provider => provider.id));
+    const live = this.loadedProviders();
+    const loaded = new Set(live);
+    const providers = this.everyProvider ? live : [...this.routes];
     const models = [];
     const unavailable = [];
-    for (const provider of this.routes) {
+    for (const provider of providers) {
       if (!loaded.has(provider)) { unavailable.push(provider);continue; }
-      const listed = await llm.listModels(provider);
-      for (const model of listed) {
-        const info = await llm.resolveModelInfo(provider, model.id);
-        models.push({ provider, model: model.id, name: model.name,
-          efforts: info.reasoning?.efforts.map(e => e.id) ?? [], default_effort: info.reasoning?.defaultEffort ?? null });
-      }
+      try {
+        // One broken catalog must not hide models of healthy providers.
+        const entries = [];
+        for (const model of await llm.listModels(provider)) {
+          const info = await llm.resolveModelInfo(provider, model.id);
+          entries.push({ provider, model: model.id, name: model.name,
+            efforts: info.reasoning?.efforts.map(e => e.id) ?? [], default_effort: info.reasoning?.defaultEffort ?? null });
+        }
+        models.push(...entries);
+      } catch { unavailable.push(provider); }
     }
     return { models, unavailable_providers: unavailable };
   }
@@ -34,7 +67,10 @@ export class Desktop {
   }
 
   allow(route) {
-    if (!this.routes.has(route?.provider)) throw new Error('The selected model provider is outside the worker allowlist.');
+    const provider = route?.provider;
+    if (!this.everyProvider && !this.routes.has(provider)) throw new Error('The selected model provider is outside the worker allowlist.');
+    // A native provider unloaded after selection must not receive new work or follow-ups.
+    if (!this.loadedProviders().includes(provider)) throw new Error('The selected model provider is not loaded in this desktop profile.');
   }
 
   protect(agent) {
@@ -42,7 +78,7 @@ export class Desktop {
     this.protectedAgents.add(agent);
     const off = agent.ctx.on('agent/request', async (_message, next) => {
       const route = await next();this.allow(route);return route;
-    });
+    }, { prepend: true });
     this.context.effect(() => off, 'codex-to-agents model boundary');
   }
 
@@ -103,19 +139,21 @@ export class Desktop {
 
   async progress(order, state) {
     const { events } = await this.context.sessionQuery.readSession(state.conversation_id);
-    const input = events.find(event => event.type === 'user/message' && event.data.source?.rpcId === order.id);
+    const committed = events.find(event => event.type === 'user/message' && event.data.source?.rpcId === order.id);
+    const input = committed ?? claimedMessage(events, order.id);
     if (!input) return { status: state.status === 'uncertain' ? 'uncertain' : 'executing', progress: 'Waiting for DSH to admit this message.' };
     const subsequent = events.filter(event => event.seq > input.seq);
     const end = subsequent.find(event => event.type === 'turn/end');
     const relevant = end ? subsequent.filter(event => event.seq <= end.seq) : subsequent;
-    const text = relevant.filter(event => event.type === 'assistant/message')
+    const text = (committed ? relevant : []).filter(event => event.type === 'assistant/message')
       .flatMap(event => event.data.message?.content ?? []).filter(block => block.type === 'text')
       .map(block => block.text).join('\n').slice(-20000);
     const native = end?.data.reason;
     if (!native) return { status: 'executing', progress: text || 'DSH is executing.' };
-    const status = native.kind === 'completed' ? 'completed'
+    const status = native.kind === 'completed' ? committed ? 'completed' : 'uncertain'
       : native.kind === 'error' ? 'failed' : native.kind === 'blocked' ? 'blocked' : 'cancelled';
-    return { status, progress: text, output: { text, native_reason: native, conversation_id: state.conversation_id } };
+    const progress = text || native.error?.message || (status === 'uncertain' ? 'DSH ended before committing this prompt; inspect native history.' : '');
+    return { status, progress, output: { text, native_reason: native, conversation_id: state.conversation_id } };
   }
 
   workspace(id) {

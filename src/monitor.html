@@ -9,21 +9,95 @@
     main{max-width:760px;margin:auto;padding:32px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}h1{margin:0;font-size:19px;font-weight:600;letter-spacing:-.4px}.connection{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;white-space:nowrap}.dot{width:6px;height:6px;background:var(--muted);border-radius:50%}.dot.online{background:var(--green)}
     .settings{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}.setting-row{display:flex;justify-content:space-between;align-items:center;gap:16px}.setting-title{font-weight:600;font-size:15px}.setting-help{color:var(--muted);font-size:13px;margin:6px 0 20px}.switch{appearance:none;position:relative;flex:none;width:44px;height:26px;margin:0;background:var(--line);border:1px solid var(--muted);border-radius:20px;cursor:pointer}.switch:before{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;background:var(--panel);border-radius:50%;box-shadow:0 1px 3px #0003;transition:transform .15s}.switch:checked{background:var(--green);border-color:var(--green)}.switch:checked:before{transform:translateX(18px)}.switch:focus-visible,select:focus-visible{outline:2px solid var(--green);outline-offset:3px}.switch:disabled,select:disabled{opacity:.55;cursor:not-allowed}.selectors{display:grid;grid-template-columns:minmax(100px,.7fr) minmax(0,1.6fr);gap:16px}.field{display:grid;gap:6px;min-width:0;font-size:13px;color:var(--muted)}select{width:100%;min-width:0;height:40px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 10px;font:inherit;text-overflow:ellipsis}.model-help,.setting-message{margin:10px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.setting-message{margin-top:16px}.setting-message.error{color:#a03b34}
     @media(max-width:480px){main{padding:22px 16px}h1{font-size:17px}.settings{padding:16px}.selectors{grid-template-columns:1fr}}
-    @media(prefers-color-scheme:dark){:root{--bg:#141714;--panel:#1b201c;--line:#303830;--text:#e5ebe5;--muted:#929e94;--green:#a4c99e}.setting-message.error{color:#edaaa5}}
+    .activation-message{margin:12px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.activation-message.error{color:#a03b34}
+    @media(prefers-color-scheme:dark){:root{--bg:#141714;--panel:#1b201c;--line:#303830;--text:#e5ebe5;--muted:#929e94;--green:#a4c99e}.setting-message.error,.activation-message.error{color:#edaaa5}}
+    details.sdd{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-top:16px;overflow:hidden}
+    details.sdd summary{cursor:pointer;padding:16px 20px;font-weight:600;font-size:15px;list-style:none;display:flex;align-items:center;gap:8px}
+    details.sdd summary::-webkit-details-marker{display:none}
+    details.sdd summary:before{content:"▸";color:var(--green);font-size:12px;transition:transform .15s}
+    details.sdd[open] summary:before{transform:rotate(90deg)}
+    .sdd-body{padding:0 20px 20px;min-width:0}
+    .sdd-note{margin:0 0 14px;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+    .sdd-workspace{margin:0 0 6px}
+    .sdd-workspace-current{margin:0 0 10px;color:var(--muted);font-size:12px;overflow-wrap:anywhere;word-break:break-word}
+    .sdd-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin-top:14px}
+    .sdd-create{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin-top:12px}
+    .sdd-create .field{flex:1 1 220px}
+    .sdd input{width:100%;min-width:0;height:38px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 10px;font:inherit}
+    .sdd input:focus-visible,.sdd textarea:focus-visible,.btn:focus-visible{outline:2px solid var(--green);outline-offset:2px}
+    .sdd input:disabled,.sdd select:disabled,.sdd textarea:disabled{opacity:.55;cursor:not-allowed}
+    .sdd-editor{margin-top:16px;min-width:0}
+    .sdd textarea{display:block;width:100%;min-width:0;min-height:240px;resize:vertical;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:10px;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
+    .sdd-path-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}
+    .sdd-path{flex:1 1 220px;min-width:0;color:var(--muted);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;word-break:break-word}
+    .sdd-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
+    .btn{height:38px;padding:0 14px;border:1px solid var(--green);border-radius:7px;background:var(--green);color:#fff;font:inherit;font-size:13px;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn.secondary{background:transparent;color:var(--green)}
+    .btn.ghost{background:transparent;border-color:var(--line);color:var(--text)}
+    .btn.danger{background:transparent;border-color:#a03b34;color:#a03b34}
+    .sdd-dirty{color:#a03b34;font-size:12px}
+    .sdd-guard{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px;padding:12px;background:var(--bg);border:1px solid var(--line);border-radius:9px;font-size:13px}
+    .sdd-guard[hidden],.sdd-dirty[hidden]{display:none}
+    .sdd-guard-text{flex:1 1 260px;min-width:0;overflow-wrap:anywhere}
+    .sdd-guard-actions{display:flex;flex-wrap:wrap;gap:8px}
+    .sdd-message{margin:12px 0 0;color:var(--muted);font-size:12px;overflow-wrap:anywhere;min-height:1.5em}
+    .sdd-message.error{color:#a03b34}
+    @media(max-width:480px){details.sdd summary{padding:14px 16px}.sdd-body{padding:0 16px 16px}.sdd-grid{grid-template-columns:1fr}.sdd-create .field{flex:1 1 100%}.btn{flex:1 1 auto}}
+    @media(prefers-color-scheme:dark){.btn{color:#141714}.btn.secondary,.btn.ghost{color:var(--text)}.btn.danger{border-color:#edaaa5;color:#edaaa5}.sdd-message.error,.sdd-dirty{color:#edaaa5}}
   </style>
   <script src="/monitor-client.js" defer></script>
+  <script src="/sdd-client.js" defer></script>
 </head>
 <body><main>
   <header><h1>codex-to-agents</h1><div class="connection" aria-live="polite"><i id="online-dot" class="dot"></i><span id="online-label">连接中</span></div></header>
   <section class="settings" aria-label="派工设置">
     <div class="setting-row"><label class="setting-title" for="delegation-switch">自动派工 <span id="delegation-state">已关闭</span></label><input id="delegation-switch" class="switch" type="checkbox" role="switch" aria-label="自动派工" disabled></div>
-    <p class="setting-help">开启后，Codex 将具体编程任务交给所选 Agent，负责拆解、跟进和验收。</p>
+    <p class="setting-help">开启并完成 Hook 信任后，Codex 将具体编程任务交给所选 Agent，负责拆解、跟进和验收。</p>
     <div class="selectors">
       <label class="field" for="delegation-executor">执行端 <select id="delegation-executor" disabled><option value="hermes">Hermes</option><option value="dsh">DSH</option></select></label>
       <label class="field" for="delegation-model">可用模型 <select id="delegation-model" aria-describedby="model-help" disabled><option value="">跟随执行端默认</option></select></label>
     </div>
     <p id="model-help" class="model-help" role="status">正在读取可用模型…</p>
-    <p id="delegation-message" class="setting-message" role="status">从下一条消息生效，关闭不会取消已提交的任务。</p>
+    <p id="activation-message" class="activation-message" role="status">正在检查自动派工 Hook…</p>
+    <p id="delegation-message" class="setting-message" role="status">关闭不会取消已提交的任务。</p>
   </section>
+  <details class="sdd" id="sdd">
+    <summary>SDD 共享工作区</summary>
+    <div class="sdd-body">
+      <p id="sdd-note" class="sdd-note" role="status">SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。</p>
+      <div class="sdd-workspace">
+        <p class="sdd-workspace-current">SDD 文档目录：<span class="sdd-path" id="sdd-workspace-current">打开后加载</span></p>
+        <div class="sdd-create">
+          <label class="field" for="sdd-workspace-path">SDD 文档目录（绝对路径） <input id="sdd-workspace-path" type="text" autocomplete="off" spellcheck="false" placeholder="/绝对路径/到/SDD文档目录" disabled></label>
+          <button id="sdd-workspace-apply" class="btn secondary" type="button" disabled>使用此目录</button>
+        </div>
+        <p id="sdd-workspace-help" class="sdd-note">切换后查看该目录下的文档，原目录文件保留。</p>
+      </div>
+      <div class="sdd-grid">
+        <label class="field" for="sdd-project">项目 <select id="sdd-project" disabled><option value="">打开后加载</option></select></label>
+        <label class="field" for="sdd-task">任务 <select id="sdd-task" disabled><option value="">请先选择项目</option></select></label>
+      </div>
+      <div class="sdd-create">
+        <label class="field" for="sdd-project-name">项目名称 <input id="sdd-project-name" type="text" autocomplete="off" maxlength="120" placeholder="例如：登录模块" disabled></label>
+        <button id="sdd-project-add" class="btn secondary" type="button" disabled>新建项目</button>
+      </div>
+      <div class="sdd-create">
+        <label class="field" for="sdd-task-title">新建任务标题 <input id="sdd-task-title" type="text" autocomplete="off" maxlength="120" disabled></label>
+        <button id="sdd-task-add" class="btn secondary" type="button" disabled>新建任务</button>
+      </div>
+      <div class="sdd-editor">
+        <label class="field" for="sdd-content">任务文档（Markdown 纯文本）</label>
+        <textarea id="sdd-content" rows="14" spellcheck="false" disabled placeholder="选择任务后在此编辑 task.md"></textarea>
+        <div class="sdd-path-row"><span class="sdd-path" id="sdd-path">尚未选择任务</span><button id="sdd-copy" class="btn ghost" type="button" disabled>复制路径</button></div>
+        <div class="sdd-actions"><button id="sdd-save" class="btn" type="button" disabled>保存</button><button id="sdd-reload" class="btn ghost" type="button" disabled>重新读取</button><span id="sdd-dirty" class="sdd-dirty" hidden>未保存</span></div>
+      </div>
+      <div id="sdd-guard" class="sdd-guard" role="alert" hidden>
+        <span id="sdd-guard-text" class="sdd-guard-text"></span>
+        <span class="sdd-guard-actions"><button id="sdd-guard-keep" class="btn ghost" type="button">保留未保存修改</button><button id="sdd-guard-discard" class="btn danger" type="button">放弃修改</button></span>
+      </div>
+      <p id="sdd-message" class="sdd-message" role="status"></p>
+    </div>
+  </details>
 </main></body>
 </html>

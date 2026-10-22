@@ -17,8 +17,31 @@ export function stripExtension(text) {
   const first = text.indexOf(begin);
   if (first === -1) return text;
   const last = text.indexOf(end, first);
-  if (last === -1 || text.indexOf(begin, first + begin.length) !== -1) throw new Error('Malformed codex-to-agents markers.');
-  return text.slice(0, first) + text.slice(last + end.length).replace(/^\r?\n/, '');
+  if (last === -1 || text.indexOf(begin, first + begin.length) !== -1 || text.indexOf(end, last + end.length) !== -1) throw new Error('Malformed codex-to-agents markers.');
+  // Cordis may append other patch operations before the closing comment when
+  // it saves desktop settings. Remove our node, not the entire marked region.
+  const ownedId = '(?:"codex-to-agents-desktop"|\'codex-to-agents-desktop\'|codex-to-agents-desktop)';
+  const item = new RegExp(`^( +)-\\s+id:\\s*${ownedId}\\s*(?:#.*)?$`);
+  const ownPatch = new RegExp(`^-\\s+id:\\s*${ownedId}\\s*(?:#.*)?$`);
+  const body = text.slice(first + begin.length, last).split(/(?=^- )/m).map(operation => {
+    const lines = operation.split(/(?<=\n)/);
+    if (ownPatch.test(lines[0]?.trimEnd() ?? '')) return '';
+    if (!/^- insert:\s*(?:#.*)?$/.test(lines[0]?.trimEnd() ?? '')) return operation;
+    for (let index = lines.length - 1; index > 0; index--) {
+      const match = lines[index].trimEnd().match(item);
+      if (!match) continue;
+      let stop = index + 1;
+      while (stop < lines.length) {
+        const line = lines[stop];
+        if (line.trim() && !line.trimStart().startsWith('#') && line.match(/^ */)[0].length <= match[1].length) break;
+        stop++;
+      }
+      lines.splice(index, stop - index);
+    }
+    if (!lines.slice(1).some(line => line.trim() && !line.trimStart().startsWith('#'))) return lines.slice(1).join('');
+    return lines.join('');
+  }).join('');
+  return text.slice(0, first) + body + text.slice(last + end.length).replace(/^\r?\n/, '');
 }
 
 export function extensionBlock(settings, module = extension) {
@@ -109,7 +132,8 @@ export async function install(options) {
     return { disabled: true, backup: saved, order_history_retained: true };
   }
   const providers = options.provider?.split(',').map(item => item.trim());
-  if (!providers?.length || providers.some(item => !item)) throw new Error('Specify --provider with an existing DSH provider ID.');
+  if (!providers?.length || providers.some(item => !item)) throw new Error("Specify --provider with an existing DSH provider ID or '*'.");
+  if (providers.includes('*') && providers.length !== 1) throw new Error("Use --provider '*' alone; do not mix it with provider IDs.");
   const settings = { ...previous, home, providers, defaultDirectory: resolve(options.directory ?? join(home, 'workspace')) };
   await mkdir(settings.defaultDirectory, { recursive: true });
   // A fresh content-addressed module directory also refreshes nested ESM
@@ -167,6 +191,7 @@ export async function main(args = process.argv.slice(2)) {
     await registerMcp(home, values.codex);
     codex(['plugin', 'marketplace', 'add', plugin.root], values.codex);
     codex(['plugin', 'add', plugin.selector], values.codex);
+    await book.atomic(join(home, 'plugin-installation.json'), { codex: values.codex ?? 'codex' });
     console.log(JSON.stringify({ installed: true, ...plugin, backup: saved, restart_codex_required: true,
       hook_trust_required: true, automatic_delegation: 'unchanged; off when not configured' }, null, 2));
   } else if (command === 'worker') {
