@@ -1,108 +1,133 @@
-const labels = { running:'运行中', idle:'空闲', unloaded:'未加载', unknown:'状态未知' };
-const active = new Set(['queued','dispatching','executing']);
-let fetching = false;
+let fetching = false;let saving = false;let initialized = false;
 let refreshTimer;let stopped = false;let inView = true;let observer;
-let saving = false;let currentSetting = { enabled: false, executor: 'hermes' };
+let refreshModels = true;let revision = 0;let snapshot;let modelOptionsKey;
+let currentSetting = { enabled: false, executor: 'hermes' };
 const $ = id => document.getElementById(id);
+const executorName = executor => executor === 'hermes' ? 'Hermes' : 'DSH';
+const routeKey = route => route ? JSON.stringify([route.provider, route.model]) : '';
 
-function node(tag, text, className) {
-  const element = document.createElement(tag);
-  if (text !== undefined) element.textContent = text;
-  if (className) element.className = className;
-  return element;
+function renderModels() {
+  const executor = $('delegation-executor').value;
+  const runtime = snapshot?.worker.executors[executor];
+  const models = runtime?.models ?? [];
+  const selected = currentSetting.executor === executor ? routeKey(currentSetting.route) : '';
+  const options = [['', `跟随 ${executorName(executor)} 默认`, false],
+    ...models.map(model => [routeKey(model), `${model.name || model.model} · ${model.provider}`, false])];
+  if (selected && !options.some(([value]) => value === selected)) {
+    options.push([selected, `${currentSetting.route.model} · ${currentSetting.route.provider}（当前不可用）`, true]);
+  }
+  const key = JSON.stringify([executor, options]);
+  if (key !== modelOptionsKey) {
+    $('delegation-model').replaceChildren(...options.map(([value, text, disabled]) => {
+      const option = document.createElement('option');option.value = value;option.textContent = text;option.disabled = disabled;return option;
+    }));
+    modelOptionsKey = key;
+  }
+  $('delegation-model').value = selected;
+  $('delegation-model').disabled = !window.agentsHost || saving || stopped || !runtime?.online || Boolean(runtime.catalog_error) || !models.length;
+  $('model-help').textContent = !runtime?.online ? `${executorName(executor)} 未连接，连接后可选择模型。`
+    : runtime.catalog_error ? '模型目录暂时不可用，请稍后重试。'
+    : !models.length ? '此执行端暂未提供可用模型。'
+    : selected && !models.some(model => routeKey(model) === selected) ? '所选模型当前不可用，请重新选择。'
+    : '新任务使用所选模型，已有任务沿用原会话配置。';
 }
 
-function render(data) {
-  if (data.service) $('service-info').textContent = `后台进程 ${data.service.name} · PID ${data.service.pid} · 内存 RSS ${data.service.rss_mib} MB`;
-  if (!saving) {
+function updateConnection() {
+  const executor = $('delegation-executor').value;
+  const online = Boolean(snapshot?.worker.executors[executor]?.online);
+  $('online-dot').className = 'dot' + (online ? ' online' : '');
+  $('online-label').textContent = online ? '已连接' : '未连接';
+}
+
+function render(data, requestRevision) {
+  snapshot = data;
+  if (!saving && requestRevision === revision) {
     currentSetting = data.delegation;
     $('delegation-switch').checked = currentSetting.enabled;
     $('delegation-executor').value = currentSetting.executor;
     $('delegation-state').textContent = currentSetting.enabled ? '已开启' : '已关闭';
-    // HTTP monitoring stays read-only; preferences are edited in the native
-    // plugin so ordinary websites cannot change the user's delegation mode.
     $('delegation-switch').disabled = $('delegation-executor').disabled = !window.agentsHost;
-    if (!window.agentsHost) $('delegation-message').textContent = '请在 Codex 左侧的 Agents 看板中设置自动派工。';
-  }
-  $('online-dot').className = 'dot' + (data.worker.online ? ' online' : '');
-  $('online-label').textContent = data.worker.online ? '已连接' : '未连接';
-  const notice = !data.worker.online ? '执行端未连接，暂时无法获取实时状态。'
-    : data.warnings.length || data.worker.catalog_error ? '部分状态暂时无法获取。' : '';
-  $('notice').textContent = notice;
-  $('notice').classList.toggle('hidden', !notice);
-  $('agents').replaceChildren();
-  $('summary').textContent = `Hermes ${data.worker.executors.hermes.online ? '在线' : '离线'} · DSH ${data.worker.executors.dsh.online ? '在线' : '离线'} ｜ 进行中 ${data.summary.active} · 已完成 ${data.summary.completed} · 待处理 ${data.summary.problems}`;
-  if (!data.agents.length) $('agents').append(node('div', '暂无 Agent，派发任务后会显示在这里。', 'empty'));
-  for (const agent of data.agents) {
-    const status = agent.stale ? 'unknown' : agent.status;
-    const card = node('article', undefined, 'agent');
-    const head = node('div', undefined, 'agent-head');
-    head.append(node('span', `${agent.executor === 'hermes' ? 'Hermes' : 'DSH'} · ${agent.model ?? 'Agent'}`, 'model'),
-      node('span', labels[status] ?? status, 'status' + (status === 'running' ? ' running' : '')));
-    card.append(head);
-    if (agent.latest_title) {
-      const current = status === 'running' && active.has(agent.latest_task_status);
-      card.append(node('p', (current ? '正在做：' : '最近：') + agent.latest_title, 'task'));
+    renderModels();
+    if (currentSetting.error) {
+      $('delegation-message').className = 'setting-message error';
+      $('delegation-message').textContent = currentSetting.error;
     }
-    $('agents').append(card);
   }
-  const statuses = { queued:'等待领取', dispatching:'正在派发', executing:'执行中', completed:'已完成', failed:'失败', blocked:'已阻塞', uncertain:'待核查', cancelled:'已取消' };
-  $('orders').replaceChildren();
-  for (const order of data.orders.slice(0, 15)) {
-    const row = node('article', undefined, 'order');const head = node('div', undefined, 'order-head');
-    head.append(node('span', order.title, 'order-title'), node('span', statuses[order.status] ?? order.status, 'status'));
-    row.append(head, node('p', `${order.executor} · ${(order.error || order.output?.text || order.progress || '').slice(-500)}`, 'order-detail'));
-    $('orders').append(row);
+  updateConnection();
+  if (!window.agentsHost) {
+    $('delegation-message').textContent = '请在 Codex 的 Agents 看板中设置自动派工与模型。';
   }
-  if (!data.orders.length) $('orders').append(node('div', '暂无任务', 'empty'));
 }
 
-async function saveSetting() {
-  if (saving || !window.agentsHost) return;
-  saving = true;
-  $('delegation-switch').disabled = $('delegation-executor').disabled = true;
+async function saveSetting({ executorChanged = false } = {}) {
+  if (saving || !window.agentsHost) { return; }
+  revision++;saving = true;
+  const executor = $('delegation-executor').value;
+  const selected = executorChanged ? '' : $('delegation-model').value;
+  const input = { enabled: $('delegation-switch').checked, executor };
+  if (selected) {
+    const [provider, model] = JSON.parse(selected);input.route = { provider, model };
+  }
+  $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = true;
   try {
-    currentSetting = await window.agentsHost.call('panel_settings', { enabled: $('delegation-switch').checked, executor: $('delegation-executor').value });
-    $('delegation-state').textContent = currentSetting.enabled ? '已开启' : '已关闭';
-    $('delegation-message').textContent = '已保存，从下一条消息生效。首次安装需先在 Codex 信任插件 Hook 并新建会话。';
+    currentSetting = await window.agentsHost.call('panel_settings', input);
+    $('delegation-message').className = 'setting-message';
+    $('delegation-message').textContent = '已保存，从下一条消息生效。';
   } catch (error) {
-    $('delegation-switch').checked = currentSetting.enabled;$('delegation-executor').value = currentSetting.executor;
+    $('delegation-message').className = 'setting-message error';
     $('delegation-message').textContent = '保存失败：' + error.message;
-  } finally { saving = false;$('delegation-switch').disabled = $('delegation-executor').disabled = false; }
+  } finally {
+    saving = false;
+    $('delegation-switch').checked = currentSetting.enabled;
+    $('delegation-executor').value = currentSetting.executor;
+    $('delegation-state').textContent = currentSetting.enabled ? '已开启' : '已关闭';
+    $('delegation-switch').disabled = $('delegation-executor').disabled = stopped;
+    renderModels();updateConnection();
+    if (executorChanged) { refreshModels = true; }
+    void refresh();
+  }
 }
 $('delegation-switch').addEventListener('change', () => void saveSetting());
-$('delegation-executor').addEventListener('change', () => void saveSetting());
+$('delegation-executor').addEventListener('change', () => {
+  renderModels();updateConnection();void saveSetting({ executorChanged: true });
+});
+$('delegation-model').addEventListener('change', () => void saveSetting());
 
 async function refresh() {
-  if (fetching || stopped || document.hidden || !inView) return;
+  if (fetching || saving || stopped || document.hidden || !inView) { return; }
   fetching = true;
+  const requestRevision = revision;
+  const args = initialized ? { executor: $('delegation-executor').value } : {};
+  if (refreshModels) { args.refresh_models = true;refreshModels = false; }
   try {
-    if (window.agentsHost) render(await window.agentsHost.call('panel_snapshot'));
+    if (window.agentsHost) { render(await window.agentsHost.call('panel_snapshot', args), requestRevision); }
     else {
-      const response = await fetch('/api/snapshot', { cache:'no-store', signal:AbortSignal.timeout(5000) });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      render(await response.json());
+      const response = await fetch('/api/snapshot', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+      if (!response.ok) { throw new Error('HTTP ' + response.status); }
+      render(await response.json(), requestRevision);
     }
+    initialized = true;
   } catch {
-    if (!saving) $('delegation-switch').disabled = $('delegation-executor').disabled = true;
-    $('online-dot').className = 'dot';
-    $('online-label').textContent = '未连接';
-    $('notice').classList.remove('hidden');
-    $('notice').textContent = '监控连接中断，正在重连。';
-    for (const badge of document.querySelectorAll('.status')) {
-      badge.className = 'status';badge.textContent = '状态未知';
+    if (!saving && requestRevision === revision) {
+      $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = true;
+      $('online-dot').className = 'dot';$('online-label').textContent = '未连接';
+      $('model-help').textContent = '设置连接中断，正在重连。';
     }
-    for (const task of document.querySelectorAll('.task')) task.textContent = task.textContent.replace(/^正在做：/, '最近：');
-  } finally { fetching = false;scheduleRefresh(); }
+    refreshModels = true;
+  } finally {
+    fetching = false;
+    if (refreshModels && !saving && !stopped && !document.hidden && inView && requestRevision !== revision) { void refresh(); }
+    else { scheduleRefresh(); }
+  }
 }
 
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  if (!stopped && !document.hidden && inView) refreshTimer = setTimeout(() => void refresh(), 1000);
+  if (!stopped && !document.hidden && inView) { refreshTimer = setTimeout(() => void refresh(), 1000); }
 }
 function visibilityChanged() {
   clearTimeout(refreshTimer);
-  if (!stopped && !document.hidden && inView) void refresh();
+  if (!stopped && !document.hidden && inView) { void refresh(); }
 }
 function stopRefresh() {
   stopped = true;clearTimeout(refreshTimer);observer?.disconnect();
@@ -112,7 +137,6 @@ window.addEventListener('pagehide', () => { inView = false;clearTimeout(refreshT
 window.addEventListener('pageshow', () => { inView = true;visibilityChanged(); });
 window.agentsHost?.onClose(stopRefresh);
 if (typeof IntersectionObserver !== 'undefined') {
-  // CSS-hidden cached iframes do not always fire visibilitychange.
   observer = new IntersectionObserver(entries => {
     const visible = entries.some(entry => entry.isIntersecting);
     if (visible !== inView) { inView = visible;visibilityChanged(); }

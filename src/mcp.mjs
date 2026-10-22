@@ -12,7 +12,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
   const server = new McpServer({ name: 'codex-to-agents', version: '0.1.0' });
   if (panelOnly) {
     const { registerPanel } = await import('./panel.mjs');
-    registerPanel(server, home, { snapshot, onSettings });
+    registerPanel(server, home, { snapshot, onSettings, onRuntime });
     return server;
   }
   for (const [kind, definition] of Object.entries(definitions)) {
@@ -45,7 +45,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
     description: 'Read consumer heartbeat and cached model catalog. Select executor dsh or hermes for its snapshot; omit to see both under executors. online=false means its work remains saved until that consumer connects.',
     inputSchema: z.object({ executor: z.enum(['dsh', 'hermes']).optional() }).strict(), annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ executor }) => {
-    if (executor !== 'dsh') await onRuntime?.();
+    if (executor !== 'dsh') await onRuntime?.(executor);
     let delegation;
     try { delegation = await readDelegation(home); }
     catch { delegation = { enabled: false, error: 'Automatic delegation settings could not be read.' }; }

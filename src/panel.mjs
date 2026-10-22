@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
-import { delegationSchema, saveDelegation } from './delegation.mjs';
+import { delegationSchema, saveDelegation, readDelegation } from './delegation.mjs';
 
 export const PANEL_URI = 'ui://codex-to-agents/board/v1';
 const mimeType = 'text/html;profile=mcp-app';
@@ -21,19 +21,27 @@ async function buildHtml() {
     .replace('<script defer>', '<script type="module">');
 }
 
-export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings } = {}) {
+export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime } = {}) {
   server.registerResource('agents-board', PANEL_URI, { title: 'Agents 看板', mimeType, _meta: { ui } }, async () => ({
     contents: [{ uri: PANEL_URI, mimeType, text: await panelHtml(), _meta: {
       ui, 'openai/ui': { availableDisplayModes: ['fullscreen'], preferredDisplayMode: 'fullscreen' },
     } }],
   }));
   server.registerTool('open_panel', {
-    title: 'Agents 看板', description: 'Open the Agents board inside Codex. Shows agent status, work progress and the user-controlled automatic delegation switch.',
+    title: 'Agents 看板', description: 'Open the Agents board inside Codex to choose the execution agent, its available model and the automatic delegation switch.',
     inputSchema: z.object({}).strict(), annotations: { readOnlyHint: true, openWorldHint: false },
     _meta: { ui: { resourceUri: PANEL_URI }, 'openai/ui': { entrypoints: [{ type: 'global' }, { type: 'thread' }] } },
   }, async () => ({ content: [{ type: 'text', text: 'Agents 看板已打开。自动派工由看板中的开关控制。' }] }));
   for (const [name, description, schema, action] of [
-    ['panel_snapshot', 'Read the Agents board snapshot.', z.object({}).strict(), snapshot],
+    ['panel_snapshot', 'Read delegation preferences and available executor models. refresh_models loads the selected executor runtime without submitting work.',
+      z.object({ executor: z.enum(['hermes', 'dsh']).optional(), refresh_models: z.boolean().optional() }).strict(), async ({ executor, refresh_models }) => {
+        if (refresh_models) {
+          // Keep the switch usable while a disconnected executor is starting.
+          Promise.resolve(onRuntime?.(executor ?? (await readDelegation(home)).executor))
+            .catch(error => console.error(error.message));
+        }
+        return snapshot();
+      }],
     ['panel_settings', 'Save the automatic delegation preference selected by the user in the Agents board. Does not submit or cancel work.', delegationSchema, async input => { const value = await saveDelegation(home, input);onSettings?.();return value; }],
   ]) {
     server.registerTool(name, { description, inputSchema: schema,

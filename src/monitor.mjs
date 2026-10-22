@@ -97,7 +97,10 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
       heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,
       pid: latest?.pid ?? null, live_sessions_available: Object.values(executors).some(runtime => Array.isArray(runtime.snapshot?.sessions)),
       catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
-      executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, { online: runtime.online, last_seen: runtime.snapshot?.at ?? null }])) },
+      executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, {
+        online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
+        models: runtime.snapshot?.catalog?.models ?? [], catalog_error: runtime.snapshot?.catalog?.error ?? null,
+      }])) },
     summary, agents: [...grouped.values()], orders: orders.slice(0, limit), warnings,
   };
 }
@@ -137,7 +140,7 @@ export function renderTerminal(snapshot, { width = 110, height = 35, selected = 
   for (const agent of snapshot.agents.slice(0, 4)) {
     add(`  ${agent.executor} · ${agent.id.slice(0, 15)}  ${agent.model ?? '—'}  ${LABELS[agent.status] ?? agent.status}${agent.stale ? '（离线，状态未知）' : ''}`);
   }
-  if (snapshot.agents.length > 4) add(`  另有 ${snapshot.agents.length - 4} 个会话，网页看板可查看全部。`);
+  if (snapshot.agents.length > 4) add(`  另有 ${snapshot.agents.length - 4} 个会话，可用 monitor --json 查询。`);
   if (snapshot.worker.online && !snapshot.worker.live_sessions_available && snapshot.agents.length) add('当前消费者尚未提供实时会话快照；重载 DSH 插件后可查看。');
   add('');add(`工作单  [${{ all: '全部', active: '进行中', problems: '待处理' }[filter]}]`);
   const orders = filterOrders(snapshot.orders, filter);

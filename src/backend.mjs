@@ -23,17 +23,22 @@ export async function startBackend(home) {
   const worker = lazyHermes(home, { onError: error => console.error(error.message) });
   const previous = await readJson(join(home, 'backend.json'));
   let address;let closing;
-  let cache;let cacheAt = 0;let reading;
-  const invalidate = () => { cache = null;cacheAt = 0; };
+  let cache;let cacheAt = 0;let reading;let readingGeneration;let generation = 0;
+  const invalidate = () => { cache = null;cacheAt = 0;generation++; };
   const snapshot = async () => {
     if (cache && Date.now() - cacheAt < 1000) return cache;
-    if (reading) return reading;
-    reading = (async () => {
+    if (reading && readingGeneration === generation) return reading;
+    const startedGeneration = generation;
+    const pending = (async () => {
       const { monitorSnapshot } = await import('./monitor.mjs');
-      cache = await monitorSnapshot(home);cache.service.hermes_loaded = worker.state.loaded;
-      cacheAt = Date.now();return cache;
+      const value = await monitorSnapshot(home);value.service.hermes_loaded = worker.state.loaded;
+      if (startedGeneration === generation) {
+        cache = value;cacheAt = Date.now();
+      }
+      return value;
     })();
-    try { return await reading; } finally { reading = null; }
+    reading = pending;readingGeneration = startedGeneration;
+    try { return await pending; } finally { if (reading === pending) reading = null; }
   };
   const token = Buffer.from(headers.Authorization);
   const server = createServer(async (req, res) => {
@@ -58,7 +63,11 @@ export async function startBackend(home) {
         import('./mcp.mjs'), import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
       ]);
       const mcp = await createMcp(home, { panelOnly: path === '/board', snapshot, onSettings: invalidate,
-        onRuntime: () => worker.check({ force: true }),
+        onRuntime: async executor => {
+          if (executor !== 'dsh') {
+            await worker.check({ force: true });invalidate();
+          }
+        },
         onOrder: () => { invalidate();worker.check(); } });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on('close', () => { void transport.close();void mcp.close(); });

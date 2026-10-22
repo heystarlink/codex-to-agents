@@ -82,6 +82,16 @@ test('monitor separates identical session IDs and freshness across DSH and Herme
   assert.equal(view.orders.find(order => order.executor === 'hermes').stale, false);
 });
 
+test('model catalogs stay scoped to each executor, including catalog failures', async t => {
+  const { book, home } = await fixture(t);
+  const models = [{ provider: 'account', model: 'flash', name: 'Flash' }];
+  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models } });
+  await book.runtime({ active: false, at: new Date().toISOString(), catalog: { models: [], error: 'unavailable' } }, 'hermes');
+  const { executors } = (await monitorSnapshot(home)).worker;
+  assert.deepEqual(executors.dsh.models, models);assert.equal(executors.dsh.catalog_error, null);
+  assert.deepEqual(executors.hermes.models, []);assert.equal(executors.hermes.catalog_error, 'unavailable');
+});
+
 test('web monitor serves the real snapshot but rejects write requests, traversal and foreign hosts', async t => {
   const { home, book } = await fixture(t);
   await book.submit('work_submit', { goal: '<script>untrusted</script>', title: 'A real row' });

@@ -37,6 +37,10 @@ test('concurrent startup and HTTP clients share one backend; connection close an
     const snapshot = () => panel.callTool({ name: 'panel_snapshot', arguments: {} }).then(value => value.structuredContent);
     assert.equal((await snapshot()).service.pid, started[0].pid);
     assert.equal((await snapshot()).service.hermes_loaded, false);
+    await panel.callTool({ name: 'panel_snapshot', arguments: { executor: 'dsh', refresh_models: true } });
+    assert.equal((await backendStatus(home)).hermes_loaded, false);
+    await panel.callTool({ name: 'panel_settings', arguments: { enabled: false, executor: 'dsh' } });
+    assert.equal((await snapshot()).delegation.executor, 'dsh');
     await a.close();
     assert.equal((await backendStatus(home)).pid, started[0].pid);
     assert.equal((await b.callTool({ name: 'work_inspect', arguments: { order_id: payload.order_id } })).structuredContent.status, 'queued');

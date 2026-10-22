@@ -8,6 +8,8 @@ import { Readable, Writable } from 'node:stream';
 import vm from 'node:vm';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createMcp } from '../src/mcp.mjs';
 import { OrderBook } from '../src/orders.mjs';
 import { readDelegation, saveDelegation, delegationContext, runDelegationHook } from '../src/delegation.mjs';
 import { preparePlugin } from '../src/plugin.mjs';
@@ -51,6 +53,49 @@ test('delegation defaults OFF without creating files; ON/OFF only changes prefer
   assert.ok(!output.includes('do not leak this'));
 });
 
+test('fixed model preferences use executor catalog identities, reject unavailable routes, and can turn OFF while offline', async t => {
+  const home = await fixture(t);const book = new OrderBook(home);await book.open();
+  const route = { provider: 'account', model: 'shared-id' };
+  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [route] } }, 'dsh');
+  await saveDelegation(home, { enabled: true, executor: 'dsh', route });
+  assert.deepEqual((await readDelegation(home)).route, route);
+  assert.match(await delegationContext(home), /executor: "dsh", provider: "account", model: "shared-id"/);
+  assert.match(await delegationContext(home), /不可用时说明原因，不静默替换/);
+  const before = await readFile(join(home, 'delegation.json'), 'utf8');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route: { ...route, provider: 'other' } }), /不可用/);
+  assert.equal(await readFile(join(home, 'delegation.json'), 'utf8'), before);
+  await saveDelegation(home, { enabled: false, executor: 'dsh', route });
+  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [route], error: 'catalog failed' } }, 'dsh');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route }), /目录暂时不可用/);
+  await book.runtime({ active: false, at: new Date().toISOString(), catalog: { models: [route] } }, 'dsh');
+  await saveDelegation(home, { enabled: false, executor: 'dsh', route });
+  assert.deepEqual((await readDelegation(home)).route, route);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route }), /未连接/);
+  assert.equal((await readDelegation(home)).enabled, false);
+  await saveDelegation(home, { enabled: true, executor: 'hermes' });
+  assert.equal((await readDelegation(home)).route, undefined);
+  assert.match(await delegationContext(home), /不沿用本会话之前的固定模型偏好/);
+  assert.equal((await book.list()).length, 0);
+});
+
+test('panel refresh targets the stored or selected executor and returns without waiting for initialization', { timeout: 3000 }, async t => {
+  const home = await fixture(t);await saveDelegation(home, { enabled: false, executor: 'dsh' });
+  const refreshed = [];
+  const server = await createMcp(home, { panelOnly: true, onRuntime: executor => {
+    refreshed.push(executor);return new Promise(() => {});
+  } });
+  const client = new Client({ name: 'panel-refresh-test', version: '1' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close();await server.close(); });
+  await server.connect(a);await client.connect(b);
+  const call = args => client.callTool({ name: 'panel_snapshot', arguments: args });
+  await call({});assert.deepEqual(refreshed, []);
+  assert.equal((await call({ refresh_models: true })).structuredContent.delegation.executor, 'dsh');
+  await call({ refresh_models: true, executor: 'hermes' });
+  assert.deepEqual(refreshed, ['dsh', 'hermes']);
+  assert.equal((await new OrderBook(home).list()).length, 0);
+});
+
 test('real panel MCP exposes sidebar/resource and app-only settings, persists across connections, and never publishes orders', async t => {
   const home = await fixture(t);
   const connect = async () => {
@@ -70,6 +115,8 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   assert.equal(contents[0].mimeType, 'text/html;profile=mcp-app');
   assert.equal(contents[0]._meta['openai/ui'].preferredDisplayMode, 'fullscreen');
   assert.match(contents[0].text, /ui\/initialize/);assert.match(contents[0].text, /自动派工/);
+  assert.match(contents[0].text, /id="delegation-model"/);
+  for (const id of ['agents', 'orders', 'summary', 'service-info']) assert.ok(!contents[0].text.includes(`id="${id}"`));
   assert.ok(!contents[0].text.includes('src="/monitor-client.js"'));
   const call = async (name, args = {}) => (await client.callTool({ name, arguments: args }));
   const initial = (await call('panel_snapshot')).structuredContent;
