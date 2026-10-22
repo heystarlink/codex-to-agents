@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { OrderBook, definitions, inspectOrderId } from './orders.mjs';
 import { readDelegation } from './delegation.mjs';
+import { registerSddTask } from './sdd-tools.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
 
@@ -24,6 +25,9 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
     });
   }
+  // Model-visible document tool. The board keeps its app-only panel_sdd tool;
+  // this one reuses the same storage contract but cannot set the workspace.
+  registerSddTask(server, home);
   server.registerTool('work_inspect', {
     description: 'Read a saved work order with executor, progress, conversation ID and output. Without order_id list recent work orders. Works while execution agents are offline.',
     inputSchema: z.object({ order_id: inspectOrderId, limit: z.number().int().min(1).max(50).default(10) }).strict(),

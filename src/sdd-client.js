@@ -16,6 +16,10 @@
   };
   const state = {
     initialized: false, loaded: false,
+    // The switch is persisted independently of the document workspace. It is
+    // loaded on board start because it sits outside the collapsed section.
+    enabled: true, stateKnown: false, configError: false,
+    pendingState: false, toggleSaving: false,
     // Outstanding reads; cancelled requests must not leave the board busy.
     pendingProjects: 0, pendingTasks: 0, pendingDoc: 0,
     saving: false, busyAdd: false, busyTask: false, busyWorkspace: false,
@@ -30,12 +34,37 @@
   const editor = () => $('sdd-content');
   const read = () => editor().value ?? '';
   const dirty = () => Boolean(state.taskId) && read() !== state.baseline;
+  const disabledByServer = error => /SDD 任务文档已关闭|SDD 已关闭|SDD 工作区配置损坏|SDD 工作区配置无效/.test(error?.message ?? '');
 
   function message(text, error = false) {
     const node = $('sdd-message');
     if (!node) return;
     node.textContent = text;
     node.className = 'sdd-message' + (error ? ' error' : '');
+  }
+
+  function settingMessage(text, error = false) {
+    const node = $('sdd-setting-message');
+    if (!node) return;
+    node.textContent = text;
+    node.className = 'setting-message' + (error ? ' error' : '');
+  }
+
+  function renderEnabled() {
+    $('sdd-switch').checked = state.enabled;
+    $('sdd-state').textContent = !state.stateKnown
+      ? state.configError ? '不可用' : '读取中'
+      : state.enabled ? '已开启' : '已关闭';
+    $('sdd-summary-meta').textContent = state.enabled
+      ? '共享规划与验收约定'
+      : '共享规划与验收约定 · 已关闭，已有文件保留';
+    if (state.stateKnown && !state.enabled) {
+      $('sdd-note').textContent = 'SDD 已关闭：不再自动生成或更新任务文档，已有文件与目录配置保留。重新开启后可继续编辑。';
+    } else if (state.configError) {
+      $('sdd-note').textContent = 'SDD 设置不可用：请先重新设置 SDD 文档目录。';
+    } else {
+      $('sdd-note').textContent = DEFAULT_NOTE;
+    }
   }
 
   const workspaceChanged = error => /工作区已切换|工作区标识/.test(error?.message ?? '');
@@ -57,19 +86,24 @@
   function updateBusy() {
     const editable = canEdit();
     const busy = state.saving || state.pendingProjects > 0 || state.pendingTasks > 0 || state.pendingDoc > 0
-      || state.busyAdd || state.busyTask || state.busyWorkspace;
+      || state.busyAdd || state.busyTask || state.busyWorkspace || state.pendingState;
     const disabled = !editable || busy;
+    // Turning SDD off disables document operations only: the directory form and
+    // the delegation switch stay usable, and existing files are left alone.
+    const docDisabled = disabled || !state.enabled;
+    $('sdd-switch').disabled = !editable || state.pendingState || state.toggleSaving || state.saving
+      || state.configError || !state.stateKnown;
     $('sdd-workspace-path').disabled = disabled;
     $('sdd-workspace-apply').disabled = disabled;
-    $('sdd-project').disabled = disabled || !state.projects.length;
-    $('sdd-task').disabled = disabled || !state.projectId || !state.tasks.length;
+    $('sdd-project').disabled = docDisabled || !state.projects.length;
+    $('sdd-task').disabled = docDisabled || !state.projectId || !state.tasks.length;
     for (const id of ['sdd-project-name', 'sdd-project-add', 'sdd-task-title', 'sdd-task-add']) {
-      $(id).disabled = disabled;
+      $(id).disabled = docDisabled;
     }
-    $('sdd-content').disabled = disabled || !state.taskId;
-    $('sdd-save').disabled = disabled || !state.taskId;
-    $('sdd-reload').disabled = disabled || !state.taskId;
-    $('sdd-copy').disabled = disabled || !state.path;
+    $('sdd-content').disabled = docDisabled || !state.taskId;
+    $('sdd-save').disabled = docDisabled || !state.taskId;
+    $('sdd-reload').disabled = docDisabled || !state.taskId;
+    $('sdd-copy').disabled = docDisabled || !state.path;
   }
 
   function renderWorkspace() {
@@ -113,6 +147,7 @@
       add_project: ['新建项目', '放弃修改并新建项目'],
       add_task: ['新建任务', '放弃修改并新建任务'],
       reload: ['重新读取', '放弃修改并重新读取'],
+      disable: ['关闭 SDD 任务文档', '放弃修改并关闭 SDD'],
       close: ['关闭 SDD 共享工作区', '放弃修改并关闭'],
     };
     const [verb, discardLabel] = labels[target.type] ?? labels.reload;
@@ -145,6 +180,88 @@
     renderProjects();renderWorkspace();
   }
 
+  // The section and the always-visible switch both use this projection. The
+  // switch is restored from get_workspace, so a reload (or another board) shows
+  // the saved state instead of assuming ON.
+  function applyState(data) {
+    state.directory = data.directory ?? state.directory;
+    state.workspaceId = data.workspace_id ?? state.workspaceId;
+    state.enabled = data.enabled !== false;
+    state.stateKnown = true;
+    state.configError = false;
+    renderWorkspace();
+    renderEnabled();
+  }
+
+  async function loadState() {
+    if (!canEdit()) return;
+    state.pendingState = true;updateBusy();
+    try {
+      const data = await api('get_workspace');
+      applyState(data);
+      settingMessage(state.enabled
+        ? '关闭后不生成或更新文档，已有文件与目录配置保留。'
+        : 'SDD 已关闭：不会自动生成或更新文档，已有文件与目录配置保留。');
+    } catch (error) {
+      // A damaged settings file is reported instead of being shown as enabled;
+      // the directory form below can repair it.
+      state.stateKnown = false;state.configError = true;state.enabled = false;
+      renderEnabled();
+      settingMessage('读取 SDD 设置失败：' + error.message + ' 请先在看板中重新设置 SDD 文档目录。', true);
+      message('读取 SDD 设置失败：' + error.message, true);
+    } finally {
+      state.pendingState = false;updateBusy();updateDirty();
+    }
+  }
+
+  async function applyEnabled(enabled) {
+    if (!canEdit() || state.toggleSaving) return;
+    state.toggleSaving = true;updateBusy();
+    settingMessage(enabled ? '正在开启 SDD 任务文档…' : '正在关闭 SDD 任务文档…');
+    try {
+      const data = await api('set_enabled', { enabled });
+      applyState(data);
+      if (!state.enabled) {
+        // The editor keeps the last saved text read-only; files stay untouched.
+        if (state.taskId) editor().value = state.baseline;
+        updateDirty();
+        settingMessage('SDD 已关闭：不会自动生成或更新文档，已有文件与目录配置保留。');
+        message('已关闭 SDD 任务文档；已有文档和目录配置保留。');
+      } else {
+        settingMessage('SDD 已开启：派工前可保存任务约定。');
+        message('已开启 SDD 任务文档。');
+        state.loaded = false;
+        if ($('sdd').open) await loadProjects();
+      }
+    } catch (error) {
+      // The switch is rolled back to the last confirmed state, and the error is
+      // readable instead of leaving the UI disagreeing with storage.
+      renderEnabled();
+      settingMessage('切换 SDD 开关失败：' + error.message, true);
+      message('切换 SDD 开关失败：' + error.message, true);
+    } finally {
+      state.toggleSaving = false;updateBusy();updateDirty();
+    }
+  }
+
+  function requestEnabled() {
+    if (!canEdit() || state.toggleSaving) { renderEnabled();return; }
+    const next = $('sdd-switch').checked;
+    if (next === state.enabled) return;
+    if (!next) {
+      // Turning SDD off does not clear an unsaved draft silently: the user must
+      // keep editing (and stay ON) or explicitly discard before it turns off.
+      if (dirty()) {
+        renderEnabled();
+        showGuard({ type: 'disable' });
+        return;
+      }
+      void applyEnabled(false);
+      return;
+    }
+    void applyEnabled(true);
+  }
+
   async function applyWorkspace(directory) {
     if (!canEdit() || state.busyWorkspace) return;
     if (state.saving) { message('正在保存，请稍后再切换 SDD 文档目录。', true);return; }
@@ -153,13 +270,16 @@
     state.busyWorkspace = true;updateBusy();message('正在切换 SDD 文档目录…');
     try {
       const data = await api('set_workspace', { directory });
-      state.directory = data.directory ?? directory;
-      state.workspaceId = data.workspace_id ?? '';
+      applyState(data);
       $('sdd-workspace-path').value = '';
       // A different workspace is a different document set: the old selection is
       // cleared and the old directory is left untouched on disk.
       clearSelection();
       state.loaded = false;
+      if (!state.enabled) {
+        message(`SDD 文档目录已切换为 ${state.directory}。SDD 当前关闭，不会自动写文档；原目录文件保留。`);
+        return;
+      }
       // The listing below normally reports its own hint; on success the saved
       // directory confirmation is the more useful message, so restore it.
       const ok = await loadProjects();
@@ -173,7 +293,7 @@
   }
 
   async function loadProjects() {
-    if (!canEdit()) return false;
+    if (!canEdit() || !state.enabled) return false;
     const seq = ++state.listSeq;
     state.pendingProjects++;updateBusy();
     let ok = false;
@@ -182,7 +302,15 @@
       if (seq !== state.listSeq) return false;
       state.directory = workspace.directory ?? '';
       state.workspaceId = workspace.workspace_id ?? '';
-      renderWorkspace();
+      // Another board may have switched SDD off since this page loaded.
+      state.enabled = workspace.enabled !== false;
+      state.stateKnown = true;state.configError = false;
+      renderWorkspace();renderEnabled();
+      if (!state.enabled) {
+        message('SDD 已在其他看板关闭，本轮不会读取或写入文档；已有文件保留。', true);
+        updateBusy();
+        return false;
+      }
       const data = await docApi('list_projects');
       if (seq !== state.listSeq) return false;
       state.projects = data.projects ?? [];
@@ -199,6 +327,7 @@
     } catch (error) {
       if (seq !== state.listSeq) return false;
       if (workspaceChanged(error)) { markWorkspaceChanged();message(WORKSPACE_STALE, true); }
+      else if (disabledByServer(error)) { message('SDD 设置已变化：' + error.message, true);void loadState(); }
       else message('读取 SDD 工作区失败：' + error.message, true);
     } finally {
       state.pendingProjects--;updateBusy();
@@ -208,7 +337,7 @@
   }
 
   async function loadTasks() {
-    if (!canEdit() || !state.projectId) return;
+    if (!canEdit() || !state.projectId || !state.enabled) return;
     const seq = ++state.tasksSeq;
     const projectId = state.projectId;
     state.pendingTasks++;updateBusy();
@@ -222,6 +351,7 @@
     } catch (error) {
       if (seq !== state.tasksSeq || projectId !== state.projectId) return;
       if (workspaceChanged(error)) { markWorkspaceChanged();message(WORKSPACE_STALE, true); }
+      else if (disabledByServer(error)) { message('SDD 设置已变化：' + error.message, true);void loadState(); }
       else message('读取任务失败：' + error.message, true);
     } finally {
       state.pendingTasks--;updateBusy();
@@ -234,6 +364,7 @@
   }
 
   async function openTask(taskId) {
+    if (!state.enabled) { message('SDD 已关闭，无法读取或更新文档。', true);return; }
     if (!state.projectId || !taskId) { resetDocument();return; }
     const seq = ++state.docSeq;
     const projectId = state.projectId;
@@ -254,6 +385,7 @@
       if (seq !== state.docSeq || projectId !== state.projectId) return;
       renderTasks();
       if (workspaceChanged(error)) { markWorkspaceChanged();message(WORKSPACE_STALE, true); }
+      else if (disabledByServer(error)) { message('SDD 设置已变化：' + error.message, true);void loadState(); }
       else message('读取任务文档失败：' + error.message, true);
     } finally {
       state.pendingDoc--;updateBusy();updateDirty();
@@ -275,6 +407,7 @@
 
   async function save() {
     if (!canEdit() || state.saving || !state.taskId) return;
+    if (!state.enabled) { message('SDD 已关闭，无法保存文档。请先在看板开启 SDD。', true);void loadState();return; }
     const content = read();
     const projectId = state.projectId;
     const taskId = state.taskId;
@@ -297,6 +430,11 @@
       // backend message is shown once instead of being duplicated here.
       if (workspaceChanged(error)) {
         markWorkspaceChanged();message(WORKSPACE_STALE, true);
+      } else if (disabledByServer(error)) {
+        // Another board turned SDD off: keep the draft, stop writing, and sync
+        // the switch so this page no longer claims document writes are open.
+        message('SDD 已被关闭：' + error.message + ' 未保存的草稿仍保留在编辑器中。', true);
+        void loadState();
       } else if (/重新读取|冲突|revision/i.test(error.message)) {
         message('保存冲突：' + error.message, true);
       } else {
@@ -315,6 +453,7 @@
 
   async function createProject(name) {
     if (!canEdit() || state.busyAdd) return;
+    if (!state.enabled) { message('SDD 已关闭，无法新建项目。请先在看板开启 SDD。', true);return; }
     state.busyAdd = true;updateBusy();
     try {
       const data = await docApi('register_project', { name });
@@ -326,6 +465,7 @@
       message(data.created ? '项目已创建。' : '已有同名项目，已切换到该项目。');
     } catch (error) {
       if (workspaceChanged(error)) { markWorkspaceChanged();message(WORKSPACE_STALE, true); }
+      else if (disabledByServer(error)) { message('SDD 已被关闭：' + error.message, true);void loadState(); }
       else message('新建项目失败：' + error.message, true);
     } finally {
       state.busyAdd = false;updateBusy();
@@ -334,6 +474,7 @@
 
   function addProject() {
     if (!canEdit() || state.busyAdd) return;
+    if (!state.enabled) { message('SDD 已关闭，无法新建项目。', true);return; }
     const name = $('sdd-project-name').value.trim();
     if (!name) { message('请输入项目名称。', true);return; }
     // Never create (or switch away) while the editor holds an unsaved draft.
@@ -354,6 +495,7 @@
 
   async function createTask(title) {
     if (!canEdit() || state.busyTask) return;
+    if (!state.enabled) { message('SDD 已关闭，无法新建任务文档。请先在看板开启 SDD。', true);return; }
     state.busyTask = true;updateBusy();
     try {
       const doc = await docApi('create_task', { project_id: state.projectId, title });
@@ -365,6 +507,7 @@
       message('任务已创建。');
     } catch (error) {
       if (workspaceChanged(error)) { markWorkspaceChanged();message(WORKSPACE_STALE, true); }
+      else if (disabledByServer(error)) { message('SDD 已被关闭：' + error.message, true);void loadState(); }
       else message('新建任务失败：' + error.message, true);
     } finally {
       state.busyTask = false;updateBusy();updateDirty();
@@ -373,6 +516,7 @@
 
   function addTask() {
     if (!canEdit() || state.busyTask) return;
+    if (!state.enabled) { message('SDD 已关闭，无法新建任务文档。', true);return; }
     const title = $('sdd-task-title').value.trim();
     if (!state.projectId) { message('请先选择项目。', true);return; }
     if (!title) { message('请输入新任务标题。', true);return; }
@@ -398,6 +542,11 @@
     if (target.type === 'add_project') { void createProject(target.name);return; }
     if (target.type === 'add_task') { void createTask(target.title);return; }
     if (target.type === 'workspace') { void applyWorkspace(target.directory);return; }
+    if (target.type === 'disable') {
+      // Discarding restores the last saved text before the switch turns off; the
+      // file itself was never touched by the unsaved draft.
+      editor().value = state.baseline;updateDirty();void applyEnabled(false);return;
+    }
     if (target.type === 'project') void selectProject(target.id);
     else if (target.type === 'task') void openTask(target.id);
     else if (target.type === 'reload') void openTask(state.taskId);
@@ -409,6 +558,10 @@
   function onToggle() {
     const details = $('sdd');
     if (details.open) {
+      if (!state.enabled) {
+        message('SDD 已关闭：不会读取或写入文档。开启后可继续编辑。');
+        return;
+      }
       if (!state.loaded) void loadProjects();
       return;
     }
@@ -422,7 +575,11 @@
     if (state.initialized) return;
     state.initialized = true;
     if (!canEdit()) {
+      // The read-only HTTP monitor shows the switch but cannot change it.
       $('sdd-note').textContent = READONLY;
+      $('sdd-state').textContent = '只读';
+      $('sdd-switch').disabled = true;
+      settingMessage('SDD 开关与文档写入仅可在 Codex 看板中设置。');
       for (const id of ['sdd-workspace-path', 'sdd-workspace-apply', 'sdd-project', 'sdd-task',
         'sdd-project-name', 'sdd-project-add', 'sdd-task-title', 'sdd-task-add',
         'sdd-content', 'sdd-save', 'sdd-reload', 'sdd-copy']) {
@@ -432,6 +589,9 @@
       return;
     }
     $('sdd-note').textContent = DEFAULT_NOTE;
+    // The switch sits outside the collapsed section, so its saved state is read
+    // on board start without loading the project/task lists (kept lazy).
+    $('sdd-switch').addEventListener('change', requestEnabled);
     $('sdd').addEventListener('toggle', onToggle);
     $('sdd-workspace-apply').addEventListener('click', addWorkspace);
     $('sdd-project').addEventListener('change', () => requestProject($('sdd-project').value));
@@ -450,7 +610,8 @@
       const target = state.guard;
       if (target) discardAndRun(target);
     });
-    updateBusy();updateDirty();renderPath();renderWorkspace();
+    renderEnabled();renderPath();renderWorkspace();updateBusy();updateDirty();
+    void loadState();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });

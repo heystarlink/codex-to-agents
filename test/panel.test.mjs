@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, writeFile, access, mkdir, realpath } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, readdir, writeFile, access, mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -9,14 +9,16 @@ import vm from 'node:vm';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createMcp } from '../src/mcp.mjs';
 import { OrderBook } from '../src/orders.mjs';
 import { readDelegation, saveDelegation, delegationContext, runDelegationHook } from '../src/delegation.mjs';
 import { preparePlugin } from '../src/plugin.mjs';
-import { PANEL_URI } from '../src/panel.mjs';
+import { PANEL_URI, registerPanel } from '../src/panel.mjs';
 import { monitorWeb } from '../src/monitor-web.mjs';
 import { namedNode } from '../src/processes.mjs';
 import { stopBackend } from '../src/backend-control.mjs';
+import { readSddState, runSddAction } from '../src/sdd-workspace.mjs';
 
 const run = (command, args, { input = '', ...options } = {}) => new Promise((resolve, reject) => {
   const child = execFile(command, args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }));
@@ -43,8 +45,48 @@ test('delegation defaults OFF without creating files; ON/OFF only changes prefer
   assert.match(context, /crypto\.randomUUID\(\)/);
   assert.match(context, /首次提交与不确定重试沿用同一个 order_id 和完全相同的参数/);
   assert.match(context, /不得把任务名、cw- 会话 ID 或示例占位符当作 order_id/);
+  // ON guidance is phased and executable: read the board-selected workspace,
+  // classify by project name, create the full plan in one write, hand over the
+  // absolute task.md path after a real receipt, stop after planning-only work,
+  // and reuse only IDs previously returned for that same task.
+  assert.match(context, /sdd_task/);
+  assert.match(context, /get_workspace/);
+  assert.match(context, /按项目名称/);
+  assert.match(context, /不能把代码路径当作文档根/);
+  assert.match(context, /目标、范围、计划和验收条件/);
+  assert.match(context, /一次完整非空正文/);
+  assert.match(context, /task\.md 绝对路径/);
+  assert.match(context, /work_submit 的 goal/);
+  assert.match(context, /执行工作目录仍由 work_submit 的 directory 或 workspace_id 指向实际代码项目/);
+  assert.match(context, /3\. 仅规划：用户只要求规划时，完成第 2 步并交付规划后即结束，不继续以下派工步骤，不调用 work_submit/);
+  assert.match(context, /普通问答、讨论不创建任务文档/);
+  assert.match(context, /先 read_task 获取最新 revision，再 save_task 更新原文档/);
+  assert.match(context, /只复用当前任务已经返回的 workspace_id、project_id、task_id/);
+  assert.match(context, /不能因为名称或标题相同就自行认定为同一任务/);
+  assert.match(context, /同一任务不要重复 create_task/);
+  assert.match(context, /不同任务即使同名也分别创建/);
+  assert.match(context, /真实回执/);
+  assert.match(context, /路径交接/);
+  assert.match(context, /不扫描或改写项目里的其他文档/);
+  assert.match(context, /只保存文档不会自动派工/);
+  assert.match(context, /不得假称已保存/);
+  assert.match(context, /跳过或不需要文档时遵从/);
+  assert.match(context, /sdd_task 缺失或保存失败/);
+  const phases = ['1. 分析', '2. 保存', '3. 仅规划', '4. 路径交接与派工', '5. 同一任务更新', '6. 边界']
+    .map(phase => context.indexOf(phase));
+  assert.ok(phases.every(index => index >= 0), 'the hook is split into explicit phases');
+  assert.ok(phases.every((index, position) => position === 0 || phases[position - 1] < index), 'the phases stay in order');
+  const planningOnly = context.slice(phases[2], phases[3]);
+  assert.match(planningOnly, /即结束/);
+  assert.match(planningOnly, /不继续以下派工步骤/);
+  assert.ok(!planningOnly.includes('work_inspect'), 'planning-only guidance stops before the dispatch step');
+  assert.ok(!context.includes('set_workspace'), 'the hook must not invite the model to switch the document root');
+  // With SDD explicitly OFF, an OFF delegation context gives no document steps.
+  await runSddAction(home, { action: 'set_enabled', enabled: false });
   await saveDelegation(home, { enabled: false, executor: 'dsh' });
-  assert.match(await delegationContext(home), /取代本会话之前/);
+  const offContext = await delegationContext(home);
+  assert.match(offContext, /取代本会话之前/);
+  assert.ok(!offContext.includes('sdd_task'), 'OFF delegation + OFF SDD gives no automatic document instructions');
   assert.equal((await book.inspect(task.order_id)).status, 'executing');
   assert.equal((await book.list()).length, 1);
   await assert.rejects(saveDelegation(home, { enabled: 'true', executor: 'hermes' }));
@@ -59,28 +101,123 @@ test('delegation defaults OFF without creating files; ON/OFF only changes prefer
   assert.ok(!output.includes('do not leak this'));
 });
 
-test('fixed model preferences use executor catalog identities, reject unavailable routes, and can turn OFF while offline', async t => {
+test('the SDD and delegation switches drive four independent hook combinations', async t => {
+  const home = await fixture(t);
+  const sdd = enabled => runSddAction(home, { action: 'set_enabled', enabled });
+  const delegate = enabled => saveDelegation(home, { enabled, executor: 'hermes' });
+
+  // 1. SDD ON + delegation ON: save the plan, then hand over the real path and
+  // dispatch (the phased guidance from the first test).
+  await delegate(true);
+  let context = await delegationContext(home);
+  assert.match(context, /2\. 保存/);
+  assert.match(context, /task\.md 绝对路径/);
+  assert.match(context, /work_submit（executor: "hermes"）/);
+
+  // 2. SDD OFF + delegation ON: the old document context is overridden; the
+  // dispatch path stays intact with no document/path requirement.
+  await sdd(false);
+  context = await delegationContext(home);
+  assert.match(context, /SDD 任务文档开关当前为关闭/);
+  assert.match(context, /跳过任务文档保存与 task\.md 路径交接/);
+  assert.match(context, /直接按以下要求派工/);
+  assert.match(context, /work_submit（executor: "hermes"）/);
+  assert.match(context, /crypto\.randomUUID\(\)/, 'order-id safety still applies without documents');
+  assert.ok(!context.includes('sdd_task'), 'OFF SDD must not invite the model to write documents');
+  assert.doesNotMatch(context, /task\.md 绝对路径|路径交接与派工|2\. 保存/);
+
+  // 3. SDD ON + delegation OFF: a plan may be saved, but nothing is dispatched.
+  await sdd(true);
+  await delegate(false);
+  context = await delegationContext(home);
+  assert.match(context, /自动派工开关当前为关闭/);
+  assert.match(context, /sdd_task/);
+  assert.match(context, /保存后直接交付规划/);
+  assert.match(context, /只保存文档不会自动派工/);
+  assert.ok(!/使用 work_submit/.test(context), 'planning-only OFF must not instruct a dispatch');
+
+  // 4. SDD OFF + delegation OFF: neither document nor dispatch guidance.
+  await sdd(false);
+  context = await delegationContext(home);
+  assert.match(context, /自动派工开关当前为关闭/);
+  assert.match(context, /本轮不要创建或更新任务文档/);
+  assert.ok(!context.includes('sdd_task'));
+  assert.ok(!context.includes('work_submit'));
+
+  // A damaged SDD file is treated as OFF and never as the legacy ON default;
+  // delegation still works and writes stay blocked.
+  await writeFile(join(home, 'sdd-workspace.json'), '{corrupt');
+  await delegate(true);
+  context = await delegationContext(home);
+  assert.match(context, /SDD 任务文档配置无法读取，本轮按关闭处理/);
+  assert.match(context, /work_submit（executor: "hermes"）/);
+  assert.ok(!context.includes('sdd_task'));
+  const broken = await readSddState(home);
+  assert.equal(broken.enabled, false);
+  assert.match(broken.error, /配置损坏/);
+
+  // The two switches never overwrite each other's files.
+  await runSddAction(home, { action: 'set_workspace', directory: join(home, 'recovered-docs') });
+  assert.equal((await readSddState(home)).enabled, false, 'repairing the root keeps SDD OFF');
+  const delegation = JSON.parse(await readFile(join(home, 'delegation.json'), 'utf8'));
+  assert.equal(delegation.enabled, true);
+  await sdd(true);
+  assert.equal((await readDelegation(home)).enabled, true, 'the SDD switch does not change delegation');
+  await delegate(false);
+  assert.equal((await readSddState(home)).enabled, true, 'the delegation switch does not change SDD');
+});
+
+test('fixed model preferences validate catalog efforts, clear stale strengths, and can turn OFF while offline', async t => {
   const home = await fixture(t);const book = new OrderBook(home);await book.open();
   const route = { provider: 'account', model: 'shared-id' };
-  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [route] } }, 'dsh');
-  await saveDelegation(home, { enabled: true, executor: 'dsh', route });
+  const plain = { provider: 'account', model: 'plain-id' };
+  const catalog = { models: [
+    { ...route, efforts: ['low', 'high'], default_effort: 'low' },
+    { ...plain, efforts: [] },
+  ] };
+  const online = async (value = catalog) => book.runtime({ active: true, at: new Date().toISOString(), catalog: value }, 'dsh');
+  await online();
+  await saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'high' });
   assert.deepEqual((await readDelegation(home)).route, route);
-  assert.match(await delegationContext(home), /executor: "dsh", provider: "account", model: "shared-id"/);
-  assert.match(await delegationContext(home), /不可用时说明原因，不静默替换/);
+  assert.equal((await readDelegation(home)).effort, 'high');
+  assert.match(await delegationContext(home), /executor: "dsh", provider: "account", model: "shared-id", effort: "high"/);
+  assert.match(await delegationContext(home), /不可用时说明原因，不静默替换或降级强度/);
+  // "default" means no pinned strength: persist no effort and omit it from the hook.
+  await saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'default' });
+  assert.equal((await readDelegation(home)).effort, undefined);
+  let context = await delegationContext(home);
+  assert.doesNotMatch(context, /effort: /);
+  assert.match(context, /思考强度跟随模型默认/);
+  assert.match(context, /不显式传 effort/);
+  // Only catalog efforts are valid, and only alongside a fixed route.
   const before = await readFile(join(home, 'delegation.json'), 'utf8');
-  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route: { ...route, provider: 'other' } }), /不可用/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'invented' }), /思考强度/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route: plain, effort: 'low' }), /思考强度/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', effort: 'high' }), /思考强度需要与固定模型/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route: { ...route, provider: 'other' }, effort: 'high' }), /不可用/);
   assert.equal(await readFile(join(home, 'delegation.json'), 'utf8'), before);
-  await saveDelegation(home, { enabled: false, executor: 'dsh', route });
-  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [route], error: 'catalog failed' } }, 'dsh');
-  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route }), /目录暂时不可用/);
-  await book.runtime({ active: false, at: new Date().toISOString(), catalog: { models: [route] } }, 'dsh');
-  await saveDelegation(home, { enabled: false, executor: 'dsh', route });
+  // Re-pin, then an offline save may still close the switch and keep the pin.
+  await saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'high' });
+  await book.runtime({ active: false, at: new Date().toISOString(), catalog }, 'dsh');
+  await saveDelegation(home, { enabled: false, executor: 'dsh', route, effort: 'high' });
   assert.deepEqual((await readDelegation(home)).route, route);
-  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route }), /未连接/);
+  assert.equal((await readDelegation(home)).effort, 'high');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'high' }), /未连接/);
   assert.equal((await readDelegation(home)).enabled, false);
+  // Catalog errors still block a new selection instead of silently dropping effort.
+  await online({ models: [{ ...route, efforts: ['low', 'high'] }], error: 'catalog failed' });
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', route, effort: 'high' }), /目录暂时不可用/);
+  await online();
+  // Switching models clears the strength; switching executor clears both.
+  await saveDelegation(home, { enabled: true, executor: 'dsh', route: plain });
+  assert.equal((await readDelegation(home)).effort, undefined);
+  assert.deepEqual((await readDelegation(home)).route, plain);
   await saveDelegation(home, { enabled: true, executor: 'hermes' });
   assert.equal((await readDelegation(home)).route, undefined);
-  assert.match(await delegationContext(home), /不沿用本会话之前的固定模型偏好/);
+  assert.equal((await readDelegation(home)).effort, undefined);
+  context = await delegationContext(home);
+  assert.match(context, /跟随执行端默认模型和思考强度/);
+  assert.match(context, /不沿用本会话之前的固定模型偏好或固定强度/);
   assert.equal((await book.list()).length, 0);
 });
 
@@ -113,18 +250,24 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   };
   const client = await connect();
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 4);
+  assert.deepEqual(tools.map(tool => tool.name).sort(), ['open_panel', 'panel_sdd', 'panel_settings', 'panel_snapshot', 'panel_update'],
+    'the board catalog stays exactly five app-only tools');
   const opener = tools.find(tool => tool.name === 'open_panel');
   assert.equal(opener._meta.ui.resourceUri, PANEL_URI);
   assert.deepEqual(opener._meta['openai/ui'].entrypoints, [{ type: 'global' }, { type: 'thread' }]);
   assert.deepEqual(tools.find(tool => tool.name === 'panel_settings')._meta.ui.visibility, ['app']);
   assert.deepEqual(tools.find(tool => tool.name === 'panel_sdd')._meta.ui.visibility, ['app']);
+  assert.deepEqual(tools.find(tool => tool.name === 'panel_update')._meta.ui.visibility, ['app']);
   assert.equal((await client.listResources()).resources[0].uri, PANEL_URI);
   const { contents } = await client.readResource({ uri: PANEL_URI });
   assert.equal(contents[0].mimeType, 'text/html;profile=mcp-app');
   assert.equal(contents[0]._meta['openai/ui'].preferredDisplayMode, 'fullscreen');
   assert.match(contents[0].text, /ui\/initialize/);assert.match(contents[0].text, /自动派工/);
   assert.match(contents[0].text, /id="delegation-model"/);
+  assert.match(contents[0].text, /id="delegation-effort"/);
+  assert.match(contents[0].text, /id="update"/);
+  assert.match(contents[0].text, /id="update-refresh"/);
+  assert.match(contents[0].text, /author: /);
   assert.match(contents[0].text, /id="activation-message"/);
   assert.match(contents[0].text, /id="sdd"/);
   assert.match(contents[0].text, /SDD 共享工作区/);
@@ -153,6 +296,63 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   assert.equal((await new OrderBook(home).list()).length, 0);
   const { stdout } = await run(process.execPath, [entry, 'delegation-hook', '--home', home], { input: '' });
   assert.match(JSON.parse(stdout).hookSpecificOutput.additionalContext, /开关当前为关闭/);
+});
+
+test('panel_update is app-only, action-only, lazy, and returns the update contract without touching work orders', async t => {
+  const home = await fixture(t);
+  const calls = [];
+  const contract = { status: 'available', current: '1111111', latest: '2222222', branch: 'main', message: '发现 2 个新提交。', restart_required: true };
+  const server = new McpServer({ name: 'panel-update-test', version: '1.0' });
+  registerPanel(server, home, { runUpdate: async (root, input) => { calls.push({ root, input });return contract; } });
+  const client = new Client({ name: 'panel-update-test', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close();await server.close(); });
+  await server.connect(a);await client.connect(b);
+  const tools = (await client.listTools()).tools;
+  const update = tools.find(tool => tool.name === 'panel_update');
+  assert.ok(update);
+  assert.deepEqual(update._meta.ui, { resourceUri: PANEL_URI, visibility: ['app'] });
+  assert.deepEqual([...update.inputSchema.properties.action.enum], ['status', 'check', 'apply', 'check_daily']);
+  for (const key of ['path', 'directory', 'url', 'command']) assert.equal(update.inputSchema.properties[key], undefined, key);
+  const call = args => client.callTool({ name: 'panel_update', arguments: args });
+  for (const action of ['status', 'check', 'apply']) {
+    const response = await call({ action });
+    assert.equal(response.isError, undefined);
+    assert.deepEqual(response.structuredContent, contract);
+  }
+  assert.deepEqual(calls, ['status', 'check', 'apply'].map(action => ({ root: home, input: { action } })));
+  for (const args of [{ action: 'pull' }, { action: 'status', path: '/tmp/repo' }, { action: 'check', url: 'https://example.org' }, { action: 'apply', command: 'git pull' }]) {
+    assert.equal((await call(args)).isError, true, JSON.stringify(args));
+  }
+  assert.equal(calls.length, 3, 'invalid actions and client-supplied locations never reach the updater');
+  const beforeDaily = calls.length;
+  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, contract);
+  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, contract);
+  assert.deepEqual(calls.slice(beforeDaily).map(call => call.input.action), ['status', 'check', 'status'],
+    'the app-only daily action shares a persistent throttle instead of forwarding an unknown backend action');
+  // The update backend is imported only when an action runs, and the model
+  // catalog never exposes the update tool.
+  const source = await readFile(new URL('../src/panel.mjs', import.meta.url), 'utf8');
+  assert.match(source, /await import\('\.\/plugin-update\.mjs'\)/);
+  assert.ok(!/^import[^\n]*plugin-update/m.test(source), 'the update backend stays lazy');
+  // A status call through the real lazy backend stays local and returns the
+  // agreed contract shape; tests never run check or apply against the network.
+  const real = await createMcp(home, { panelOnly: true });
+  const realClient = new Client({ name: 'update-status-test', version: '1.0' });
+  const [e, f] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await realClient.close();await real.close(); });
+  await real.connect(e);await realClient.connect(f);
+  const live = await realClient.callTool({ name: 'panel_update', arguments: { action: 'status' } });
+  assert.equal(live.isError, undefined);
+  assert.ok(['idle', 'up_to_date', 'available', 'blocked', 'updated', 'failed'].includes(live.structuredContent.status));
+  const normal = await createMcp(home);
+  const normalClient = new Client({ name: 'model-catalog', version: '1.0' });
+  const [c, d] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await normalClient.close();await normal.close(); });
+  await normal.connect(c);await normalClient.connect(d);
+  const names = (await normalClient.listTools()).tools.map(tool => tool.name);
+  assert.ok(!names.includes('panel_update'), 'updates stay app-only');
+  assert.equal((await new OrderBook(home).list()).length, 0);
 });
 
 test('plugin package points at working runtime and hook quotes task paths safely', async t => {
@@ -217,14 +417,17 @@ test('panel_sdd is app-only, object-schemed, workspace-fenced, revisioned, lazy,
   assert.ok(sdd.inputSchema.properties.action, 'the action discriminator is visible to clients');
   assert.ok(sdd.inputSchema.properties.workspace_id, 'the workspace fence is part of the discoverable schema');
   assert.deepEqual([...sdd.inputSchema.properties.action.enum].sort(),
-    ['create_task', 'get_workspace', 'list_projects', 'list_tasks', 'read_task', 'register_project', 'save_task', 'set_workspace']);
+    ['create_task', 'get_workspace', 'list_projects', 'list_tasks', 'read_task', 'register_project', 'save_task', 'set_enabled', 'set_workspace']);
+  assert.equal(sdd.inputSchema.properties.enabled.type, 'boolean', 'the board-only switch is part of the app schema');
   const call = async (name, args = {}) => client.callTool({ name, arguments: args });
 
   await call('panel_snapshot');
   await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 'snapshots never touch document storage');
   const initial = (await call('panel_sdd', { action: 'get_workspace' })).structuredContent;
   assert.equal(initial.default, true);
-  assert.equal(initial.directory, await realpath(join(home, 'sdd')));
+  assert.equal(initial.enabled, true, 'legacy default is ON');
+  assert.equal(initial.directory, join(await realpath(home), 'sdd'));
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 'reading the switch creates no default root');
   const initialId = initial.workspace_id;
   assert.match(initialId, /^[a-f0-9]{16}$/);
   const listed = (await call('panel_sdd', { action: 'list_projects', workspace_id: initialId })).structuredContent;
@@ -275,7 +478,8 @@ test('panel_sdd is app-only, object-schemed, workspace-fenced, revisioned, lazy,
   assert.equal(switched.directory, await realpath(nextRoot));
   assert.equal(switched.changed, true);
   assert.notEqual(switched.workspace_id, initialId);
-  assert.deepEqual(JSON.parse(await readFile(join(home, 'sdd-workspace.json'), 'utf8')), { directory: await realpath(nextRoot) });
+  assert.deepEqual(JSON.parse(await readFile(join(home, 'sdd-workspace.json'), 'utf8')),
+    { directory: await realpath(nextRoot), enabled: true });
   assert.deepEqual((await call('panel_sdd', { action: 'list_projects', workspace_id: switched.workspace_id })).structuredContent.projects, []);
   const fenced = await call('panel_sdd', {
     action: 'save_task', workspace_id: initialId, project_id: projectId, task_id: created.task.id,
@@ -307,13 +511,219 @@ test('panel_sdd is app-only, object-schemed, workspace-fenced, revisioned, lazy,
   t.after(async () => { await normalClient.close();await normal.close(); });
   await normal.connect(a);await normalClient.connect(b);
   const names = (await normalClient.listTools()).tools.map(tool => tool.name);
+  assert.deepEqual(names.sort(), ['conversation_control', 'runtime_info', 'sdd_task', 'work_inspect', 'work_submit', 'work_update', 'workspace_control'],
+    'the model sees exactly the dispatch/inspection tools plus sdd_task');
   assert.ok(!names.includes('panel_sdd'), 'documents are app-only, not a model-visible tool');
   assert.ok(!names.includes('open_panel'));
 
   const source = await readFile(new URL('../src/panel.mjs', import.meta.url), 'utf8');
   assert.match(source, /await import\('\.\/sdd-workspace\.mjs'\)/);
   assert.ok(!/^import[^\n]*sdd-workspace/m.test(source), 'storage stays lazy');
+  const toolsSource = await readFile(new URL('../src/sdd-tools.mjs', import.meta.url), 'utf8');
+  assert.match(toolsSource, /await import\('\.\/sdd-workspace\.mjs'\)/);
+  assert.ok(!/^import[^\n]*sdd-workspace/m.test(toolsSource), 'the model tool keeps storage lazy too');
+  assert.ok(!/sdd-workspace/.test(await readFile(new URL('../src/mcp.mjs', import.meta.url), 'utf8')),
+    'mcp.mjs only loads the lightweight schema module');
   assert.equal((await new OrderBook(home).list()).length, 0, 'document actions never create work orders');
+});
+
+test('model sdd_task and panel_sdd share documents; panel edits fence stale model revisions and old workspace ids', async t => {
+  const home = await fixture(t);
+  const connect = async options => {
+    const server = await createMcp(home, options);
+    const client = new Client({ name: 'shared-document-test', version: '1.0' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    t.after(async () => { await client.close();await server.close(); });
+    await server.connect(a);await client.connect(b);
+    return client;
+  };
+  const model = await connect();
+  const panel = await connect({ panelOnly: true });
+  const call = (client, name, args = {}) => client.callTool({ name, arguments: args });
+  const modelCall = args => call(model, 'sdd_task', args);
+  const panelCall = args => call(panel, 'panel_sdd', args);
+
+  const modelWorkspace = (await modelCall({ action: 'get_workspace' })).structuredContent;
+  const panelWorkspace = (await panelCall({ action: 'get_workspace' })).structuredContent;
+  assert.equal(panelWorkspace.workspace_id, modelWorkspace.workspace_id, 'both surfaces use the one board-selected document root');
+  const workspaceId = modelWorkspace.workspace_id;
+
+  const registered = (await modelCall({ action: 'register_project', workspace_id: workspaceId, name: '共享规划工程' })).structuredContent;
+  const projectId = registered.project.id;
+  const taskDirectories = async () => (await readdir(registered.project.path))
+    .filter(name => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name));
+  const plan = '# 共享规划\n\n## 目标\n\n模型保存的实际规划。\n\n## 范围\n\n仅文档。\n\n## 计划\n\n1. 写入\n\n## 验收条件\n\n- [ ] 看板可读\n';
+  const created = (await modelCall({ action: 'create_task', workspace_id: workspaceId, project_id: projectId, content: plan })).structuredContent;
+  assert.equal(await readFile(created.path, 'utf8'), plan);
+  assert.doesNotMatch(plan, /待填写/);
+
+  const panelProjects = (await panelCall({ action: 'list_projects', workspace_id: workspaceId })).structuredContent.projects;
+  assert.ok(panelProjects.some(project => project.id === projectId && project.name === '共享规划工程'));
+  const panelTasks = (await panelCall({ action: 'list_tasks', workspace_id: workspaceId, project_id: projectId })).structuredContent.tasks;
+  assert.equal(panelTasks.length, 1);
+  assert.equal(panelTasks[0].id, created.task.id);
+  assert.equal(panelTasks[0].title, '共享规划');
+  const panelRead = (await panelCall({ action: 'read_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id })).structuredContent;
+  assert.equal(panelRead.content, plan);
+  assert.equal(panelRead.path, created.path);
+  assert.equal(panelRead.revision, created.revision);
+
+  // The board edits the same task; the model must re-read before saving.
+  const marker = '看板修改-marker-42';
+  const panelSaved = (await panelCall({
+    action: 'save_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id,
+    content: `# 看板更新\n\n${marker}\n`, revision: panelRead.revision,
+  })).structuredContent;
+  assert.match(panelSaved.content, new RegExp(marker));
+  const modelReread = (await modelCall({ action: 'read_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id })).structuredContent;
+  assert.equal(modelReread.revision, panelSaved.revision);
+  assert.match(modelReread.content, new RegExp(marker));
+
+  const stale = await modelCall({
+    action: 'save_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id,
+    content: '# 模型旧稿\n', revision: created.revision,
+  });
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /重新读取|冲突/);
+  assert.equal(await readFile(created.path, 'utf8'), panelSaved.content, 'a stale model save must not overwrite the panel edit');
+
+  // After re-reading, the model updates the same task ID and the board reads it.
+  const modelUpdated = (await modelCall({
+    action: 'save_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id,
+    content: `# 模型更新\n\n${marker}-model\n`, revision: modelReread.revision,
+  })).structuredContent;
+  assert.equal(await readFile(created.path, 'utf8'), modelUpdated.content);
+  const panelReread = (await panelCall({ action: 'read_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id })).structuredContent;
+  assert.equal(panelReread.revision, modelUpdated.revision);
+  assert.match(panelReread.content, new RegExp(`${marker}-model`));
+
+  // The board's legacy template create_task still works untouched.
+  const template = (await panelCall({ action: 'create_task', workspace_id: workspaceId, project_id: projectId, title: '看板模板任务' })).structuredContent;
+  assert.match(template.content, /^# 看板模板任务/);
+  assert.match(template.content, /待填写/);
+  assert.equal(await readFile(template.path, 'utf8'), template.content);
+
+  // The model's create_task cannot fall back to a placeholder.
+  const beforeRejected = (await taskDirectories()).length;
+  const titleOnly = await modelCall({ action: 'create_task', workspace_id: workspaceId, project_id: projectId, title: '模型模板' });
+  assert.equal(titleOnly.isError, true);
+  assert.match(titleOnly.content[0].text, /完整非空|content/);
+  assert.equal((await taskDirectories()).length, beforeRejected, 'a rejected model create leaves no task folder');
+
+  // A board workspace switch fences the model's old identifier; the old file is untouched.
+  const nextRoot = join(home, 'switched-docs');
+  const switched = (await panelCall({ action: 'set_workspace', directory: nextRoot })).structuredContent;
+  assert.notEqual(switched.workspace_id, workspaceId);
+  const fenced = await modelCall({
+    action: 'save_task', workspace_id: workspaceId, project_id: projectId, task_id: created.task.id,
+    content: '# 旧工作区覆盖\n', revision: modelUpdated.revision,
+  });
+  assert.equal(fenced.isError, true);
+  assert.match(fenced.content[0].text, /工作区已切换|重新读取工作区/);
+  assert.equal(await readFile(created.path, 'utf8'), modelUpdated.content);
+  const fencedList = await modelCall({ action: 'list_tasks', workspace_id: workspaceId, project_id: projectId });
+  assert.equal(fencedList.isError, true);
+  const modelSwitch = await modelCall({ action: 'set_workspace', directory: nextRoot });
+  assert.equal(modelSwitch.isError, true, 'the model can never switch the document root');
+  assert.deepEqual((await panelCall({ action: 'list_projects', workspace_id: switched.workspace_id })).structuredContent.projects, []);
+
+  const book = new OrderBook(home);await book.open();
+  assert.deepEqual(await book.list(), [], 'saving planning documents never creates work orders');
+});
+
+test('panel_sdd owns the SDD switch; the model tool cannot change it or write while OFF', async t => {
+  const home = await fixture(t);
+  const connect = async options => {
+    const server = await createMcp(home, options);
+    const client = new Client({ name: 'sdd-switch-test', version: '1.0' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    t.after(async () => { await client.close();await server.close(); });
+    await server.connect(a);await client.connect(b);
+    return client;
+  };
+  const model = await connect();
+  const panel = await connect({ panelOnly: true });
+  const call = (client, name, args = {}) => client.callTool({ name, arguments: args });
+  const modelCall = args => call(model, 'sdd_task', args);
+  const panelCall = args => call(panel, 'panel_sdd', args);
+
+  // Defaults: ON, but reading the state creates no document root.
+  const workspace = (await panelCall({ action: 'get_workspace' })).structuredContent;
+  assert.equal(workspace.enabled, true, 'legacy default stays ON');
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' });
+
+  // The board is the only switch writer; the saved state is reported to both
+  // surfaces and survives without a document directory.
+  const off = (await panelCall({ action: 'set_enabled', enabled: false })).structuredContent;
+  assert.equal(off.enabled, false);
+  assert.equal(off.directory, workspace.directory);
+  assert.equal((await modelCall({ action: 'get_workspace' })).structuredContent.enabled, false);
+  assert.deepEqual(JSON.parse(await readFile(join(home, 'sdd-workspace.json'), 'utf8')), { enabled: false });
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 'saving the switch writes no document root');
+
+  // Every model write is refused while OFF, and the model schema exposes neither
+  // the switch nor the root.
+  for (const args of [
+    { action: 'register_project', workspace_id: workspace.workspace_id, name: '关闭后' },
+    { action: 'create_task', workspace_id: workspace.workspace_id, project_id: 'a'.repeat(16), content: '# 关闭后\n' },
+  ]) {
+    const rejected = await modelCall(args);
+    assert.equal(rejected.isError, true, JSON.stringify(args));
+    assert.match(rejected.content[0].text, /SDD 任务文档已关闭|已关闭/);
+  }
+  assert.equal((await modelCall({ action: 'set_enabled', enabled: true })).isError, true);
+  assert.equal((await modelCall({ action: 'set_workspace', directory: join(home, 'x') })).isError, true);
+  assert.equal((await modelCall({ action: 'get_workspace', enabled: true })).isError, true);
+  assert.deepEqual((await modelCall({ action: 'list_projects', workspace_id: workspace.workspace_id })).structuredContent.projects, [],
+    'reads stay available so existing files can be inspected');
+
+  // Switching the root while OFF preserves the switch; only an explicit ON
+  // restores writes.
+  const root = join(home, 'board-root');
+  const switched = (await panelCall({ action: 'set_workspace', directory: root })).structuredContent;
+  assert.equal(switched.enabled, false, 'set_workspace must not turn SDD on');
+  const on = (await panelCall({ action: 'set_enabled', enabled: true })).structuredContent;
+  assert.equal(on.enabled, true);
+  assert.equal(on.directory, switched.directory);
+  assert.deepEqual(JSON.parse(await readFile(join(home, 'sdd-workspace.json'), 'utf8')),
+    { directory: switched.directory, enabled: true });
+  const project = (await modelCall({ action: 'register_project', workspace_id: on.workspace_id, name: '重新开启' })).structuredContent.project;
+  const plan = '# 重新开启\n\n## 目标\n\n恢复写入。\n';
+  const created = (await modelCall({
+    action: 'create_task', workspace_id: on.workspace_id, project_id: project.id, content: plan,
+  })).structuredContent;
+  assert.equal(await readFile(created.path, 'utf8'), plan);
+
+  // A stale writer that still believes SDD is ON is rejected by storage, and
+  // the existing file stays byte-for-byte unchanged.
+  const secondPanel = await connect({ panelOnly: true });
+  assert.equal((await modelCall({ action: 'get_workspace' })).structuredContent.enabled, true);
+  await call(secondPanel, 'panel_sdd', { action: 'set_enabled', enabled: false });
+  const blocked = await modelCall({
+    action: 'save_task', workspace_id: on.workspace_id, project_id: project.id, task_id: created.task.id,
+    content: '# 旧看板覆盖\n', revision: created.revision,
+  });
+  assert.equal(blocked.isError, true);
+  assert.match(blocked.content[0].text, /已关闭/);
+  assert.equal(await readFile(created.path, 'utf8'), plan);
+  const panelBlocked = await call(secondPanel, 'panel_sdd', {
+    action: 'save_task', workspace_id: on.workspace_id, project_id: project.id, task_id: created.task.id,
+    content: '# 旧看板覆盖\n', revision: created.revision,
+  });
+  assert.equal(panelBlocked.isError, true, 'a stale board is also refused, not just the model');
+  assert.match(panelBlocked.content[0].text, /已关闭/);
+
+  // A damaged settings file is reported and cannot silently enable writes.
+  await writeFile(join(home, 'sdd-workspace.json'), '{corrupt');
+  const corrupt = await modelCall({ action: 'register_project', workspace_id: on.workspace_id, name: '损坏工程' });
+  assert.equal(corrupt.isError, true);
+  assert.match(corrupt.content[0].text, /配置损坏/);
+  const corruptPanel = await call(secondPanel, 'panel_sdd', { action: 'get_workspace' });
+  assert.equal(corruptPanel.isError, true);
+  assert.match(corruptPanel.content[0].text, /配置损坏/);
+
+  const book = new OrderBook(home);await book.open();
+  assert.deepEqual(await book.list(), [], 'switching SDD never creates work orders');
 });
 
 // Old board pages send document actions with a code directory and no
@@ -412,18 +822,18 @@ test('panel_sdd new workspace contract still works end to end', async t => {
   assert.equal((await new OrderBook(home).list()).length, 0);
 });
 
-test('board/v2 is the only panel resource and every board metadata reference points at it', async t => {
+test('board/v3 is the only panel resource and every board metadata reference points at it', async t => {
   const home = await fixture(t);
   const client = await openPanelClient(t, home);
   const legacyUri = ['ui://codex-to-agents/board', 'v1'].join('/');
   const resources = (await client.listResources()).resources;
   assert.equal(resources.length, 1, 'exactly one canonical board resource');
   assert.equal(resources[0].uri, PANEL_URI);
-  assert.ok(PANEL_URI.endsWith('/v2'));
+  assert.ok(PANEL_URI.endsWith('/v3'));
   assert.ok(!resources.some(resource => resource.uri === legacyUri), 'no v1 compatibility alias is listed');
   const tools = (await client.listTools()).tools;
   assert.equal(tools.find(tool => tool.name === 'open_panel')._meta.ui.resourceUri, PANEL_URI);
-  for (const name of ['panel_snapshot', 'panel_settings', 'panel_sdd']) {
+  for (const name of ['panel_snapshot', 'panel_settings', 'panel_sdd', 'panel_update']) {
     assert.equal(tools.find(tool => tool.name === name)._meta.ui.resourceUri, PANEL_URI, name);
   }
   const { contents } = await client.readResource({ uri: PANEL_URI });
@@ -431,13 +841,17 @@ test('board/v2 is the only panel resource and every board metadata reference poi
   assert.equal(contents[0].uri, PANEL_URI);
   const html = contents[0].text;
   assert.match(html, /id="sdd"/);
+  assert.match(html, /id="update"/);
+  assert.match(html, /id="update-check"/);
+  assert.match(html, /id="update-refresh"/);
+  assert.match(html, /id="update-apply"/);
   assert.match(html, /SDD 共享工作区/);
   assert.match(html, /id="sdd-workspace-path"/);
   assert.ok(!html.includes('id="sdd-project-path"'), 'the board form must not ask for a code directory');
   assert.ok(!html.includes(legacyUri), 'the served board page must not mention the old resource URI');
   const source = await readFile(new URL('../src/panel.mjs', import.meta.url), 'utf8');
   assert.ok(!source.includes(legacyUri), 'no old board URI literal remains in src/panel.mjs');
-  assert.match(source, /board\/v2/);
+  assert.match(source, /board\/v3/);
 });
 
 test('read-only HTTP monitor serves the shared-doc shell but still rejects writes', async t => {
@@ -448,6 +862,10 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   assert.equal(page.status, 200);
   const html = await page.text();
   assert.match(html, /id="sdd"/);
+  assert.match(html, /id="update"/);
+  assert.match(html, /id="update-refresh"/);
+  assert.match(html, /id="delegation-effort"/);
+  assert.match(html, /author: /);
   assert.match(html, /SDD 共享工作区/);
   assert.match(html, /SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。/);
   assert.match(html, /id="sdd-workspace-path"/);
@@ -459,6 +877,11 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   const source = await script.text();
   assert.match(source, /panel_sdd/);
   assert.match(source, /请在 Codex 看板中管理共享任务文档/);
+  const monitorScript = await fetch(dashboard.url + '/monitor-client.js');
+  assert.equal(monitorScript.status, 200);
+  const monitorSource = await monitorScript.text();
+  assert.match(monitorSource, /panel_update/);
+  assert.match(monitorSource, /请在 Codex 的 Agents 看板中检查更新/);
   const write = await fetch(dashboard.url + '/api/snapshot', { method: 'POST' });
   assert.equal(write.status, 405);
   assert.equal(await write.text(), 'Read-only monitor.');

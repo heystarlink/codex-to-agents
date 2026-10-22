@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
 import { delegationSchema, saveDelegation, readDelegation } from './delegation.mjs';
 
-export const PANEL_URI = 'ui://codex-to-agents/board/v2';
+export const PANEL_URI = 'ui://codex-to-agents/board/v3';
 // Old board pages predate the workspace fence: they send document actions with
 // a code `directory` and no workspace_id. Such a request has no root identity,
 // so it cannot be upgraded or executed safely (another board may already have
@@ -23,17 +23,26 @@ const sddTitle = z.string().trim().min(1).max(120);
 // sdd-workspace.mjs enforce the per-action discriminated union (required fields,
 // unknown keys, workspace fencing, path/ID formats) inside the handler.
 const sddSchema = z.object({
-  action: z.enum(['get_workspace', 'set_workspace', 'list_projects', 'register_project',
+  action: z.enum(['get_workspace', 'set_workspace', 'set_enabled', 'list_projects', 'register_project',
     'list_tasks', 'create_task', 'read_task', 'save_task']),
   workspace_id: sddWorkspaceId.optional(),
   project_id: sddProjectId.optional(),
   task_id: sddTaskId.optional(),
   directory: z.string().trim().min(1).max(4096).optional(),
+  // Board-only switch. The model-facing sdd_task has no such action.
+  enabled: z.boolean().optional(),
   name: z.string().trim().min(1).max(120).optional(),
   title: sddTitle.optional(),
   content: z.string().optional(),
   revision: z.string().regex(/^[a-f0-9]{64}$/, '文档版本无效，请重新读取。').optional(),
 }).strict();
+
+// The plugin updater is a separate module owned by the update backend. The
+// board only ever forwards an action: the server resolves the
+// installation directory, the verified project remote and the command itself.
+const updateSchema = z.object({ action: z.enum(['status', 'check', 'apply', 'check_daily']) }).strict();
+const UPDATE_STATUSES = new Set(['idle', 'checking', 'up_to_date', 'available', 'blocked', 'updating', 'updated', 'failed']);
+const UPDATE_DESCRIPTION = 'Read, check or install updates for the local codex-to-agents plugin installation. status reads the cached local state without network access; check contacts the verified project remote; check_daily checks at most once per 24 hours across boards; apply installs a fast-forward update of the verified default branch while the installation is clean and idle. Accepts only action, never a path, URL or command. App-only; the model cannot see or call it.';
 
 let builtHtml;
 export async function panelHtml() {
@@ -49,7 +58,7 @@ async function buildHtml() {
     .replace('<script defer>', '<script type="module">');
 }
 
-export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel } = {}) {
+export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel, runUpdate } = {}) {
   server.registerResource('agents-board', PANEL_URI, { title: 'Agents 看板', mimeType, _meta: { ui } }, async () => ({
     contents: [{ uri: PANEL_URI, mimeType, text: await panelHtml(), _meta: {
       ui, 'openai/ui': { availableDisplayModes: ['fullscreen'], preferredDisplayMode: 'fullscreen' },
@@ -82,12 +91,14 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
     });
   }
   // App-only SDD workspace. This is the board's write path for a shared
-  // document directory (home/sdd by default) and its task.md files; the
-  // read-only HTTP monitor never exposes it. Loading sdd-workspace.mjs is
-  // deferred until the user's first workspace/document action.
+  // document directory (home/sdd by default), its task.md files, and the SDD
+  // on/off switch; the read-only HTTP monitor never exposes it. Loading
+  // sdd-workspace.mjs is deferred until the user's first workspace/document
+  // action. Reads and writes both honor the saved switch; only set_enabled
+  // changes it and no model-visible tool can.
   server.registerTool('panel_sdd', {
     title: 'SDD 共享工作区',
-    description: 'Read or change the shared SDD document workspace selected by the user in the Agents board, and read or save one task.md inside it. App-only; the model cannot see or call it.',
+    description: 'Read or change the shared SDD document workspace and its independent on/off switch selected by the user in the Agents board, and read or save one task.md inside it. get_workspace reports enabled; set_enabled is app-only; when off, register_project/create_task/save_task are refused. App-only; the model cannot see or call it.',
     inputSchema: sddSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },
@@ -98,6 +109,30 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
     try {
       const { runSddAction } = await import('./sdd-workspace.mjs');
       return result(await runSddAction(home, input));
+    } catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
+  });
+  // App-only plugin updater. The update backend is imported for the board's
+  // first-visible daily check or an update-card action. Reading a snapshot or
+  // saving delegation alone never loads update/git code. The client sends only the
+  // action: the server owns the installation directory, the verified project
+  // remote and the update command. This tool is registered on the panel-only
+  // MCP surface, never in the model tool catalog.
+  server.registerTool('panel_update', {
+    title: '插件更新',
+    description: UPDATE_DESCRIPTION,
+    inputSchema: updateSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },
+  }, async ({ action }) => {
+    try {
+      const update = runUpdate ?? (async (root, input) => (await import('./plugin-update.mjs')).runPluginUpdate(root, input));
+      const value = action === 'check_daily'
+        ? await (await import('./update-reminder.mjs')).checkDailyUpdate(home, update)
+        : await update(home, { action });
+      if (!value || typeof value !== 'object' || !UPDATE_STATUSES.has(value.status)) {
+        throw new Error('更新状态无效，请稍后重试。');
+      }
+      return result(value);
     } catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
   });
 }

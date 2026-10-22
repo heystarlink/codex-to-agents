@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, chmod, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 
 // Lightweight SDD documents. The board first selects a shared document
@@ -33,10 +33,21 @@ const revision = z.string().regex(/^[a-f0-9]{64}$/, '文档版本无效，请重
 export const sddSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('get_workspace') }).strict(),
   z.object({ action: z.literal('set_workspace'), directory }).strict(),
+  // The document switch is a board-only setting. The model-facing sdd_task
+  // schema deliberately omits this action; writes are refused while it is off.
+  z.object({ action: z.literal('set_enabled'), enabled: z.boolean() }).strict(),
   z.object({ action: z.literal('list_projects'), workspace_id: workspaceId }).strict(),
   z.object({ action: z.literal('register_project'), workspace_id: workspaceId, name: projectName }).strict(),
   z.object({ action: z.literal('list_tasks'), workspace_id: workspaceId, project_id: projectId }).strict(),
-  z.object({ action: z.literal('create_task'), workspace_id: workspaceId, project_id: projectId, title }).strict(),
+  // The board still creates the legacy template from a title. A caller that
+  // already has a complete plan supplies content instead; it is validated and
+  // written as the one atomic task.md creation, never as a placeholder.
+  z.object({
+    action: z.literal('create_task'), workspace_id: workspaceId, project_id: projectId,
+    title: title.optional(), content: z.string().optional(),
+  }).strict()
+    .refine(value => value.title !== undefined || value.content !== undefined, '创建任务需要标题或完整正文。')
+    .refine(value => value.content === undefined || value.content.trim().length > 0, '任务正文不能为空。'),
   z.object({ action: z.literal('read_task'), workspace_id: workspaceId, project_id: projectId, task_id: taskId }).strict(),
   z.object({
     action: z.literal('save_task'), workspace_id: workspaceId, project_id: projectId, task_id: taskId,
@@ -52,9 +63,16 @@ const projectMetaSchema = z.object({
   path: z.string().max(4096).optional(),
 }).strict();
 
+// Legacy settings stored only {directory}; a missing `enabled` keeps the old
+// automatic behavior (ON). New writes may store either field, so turning the
+// switch on a fresh install never has to persist or create the default root.
 const workspaceSchema = z.object({
-  directory: z.string().max(4096).refine(isAbsolute, 'SDD 文档目录必须是绝对路径。'),
-}).strict();
+  directory: z.string().max(4096).refine(isAbsolute, 'SDD 文档目录必须是绝对路径。').optional(),
+  enabled: z.boolean().optional(),
+}).strict().refine(value => value.directory !== undefined || value.enabled !== undefined,
+  'SDD 工作区配置无效。');
+const WRITE_ACTIONS = new Set(['register_project', 'create_task', 'save_task']);
+const SDD_DISABLED_MESSAGE = 'SDD 任务文档已关闭，未写入或创建任何文档。请由用户在 Agents 看板开启 SDD 后再操作。';
 
 export class SddError extends Error {
   constructor(message, code = 'SDD_ERROR') {
@@ -77,6 +95,20 @@ const lstatOrNull = async path => {
   try { return await lstat(path); }
   catch (error) { if (error.code === 'ENOENT') return null;throw error; }
 };
+
+// Stable identity for a directory that may not exist yet: canonicalize the
+// closest existing ancestor and append the remaining names. Reading the default
+// root therefore keeps the same workspace ID before and after the first write
+// without creating the directory as a side effect.
+async function canonicalPath(path) {
+  try { return await realpath(path); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    const parent = dirname(path);
+    if (parent === path) return path;
+    return join(await canonicalPath(parent), basename(path));
+  }
+}
 
 const processAlive = pid => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -157,35 +189,58 @@ export class SddWorkspace {
     this.home = resolve(home);
   }
 
+  // Raw settings read that never throws for a missing or damaged file. Reads
+  // report damage instead of falling back; the repair path needs to know which
+  // case it is so a missing file keeps the legacy ON default while a damaged
+  // file is never silently treated as enabled.
+  async #readConfig() {
+    const file = join(this.home, WORKSPACE_FILE);
+    const info = await lstatOrNull(file);
+    if (!info) return { kind: 'missing' };
+    if (info.isSymbolicLink() || !info.isFile()) throw new SddError('SDD 工作区配置路径不安全。', 'UNSAFE_PATH');
+    if (info.size > WORKSPACE_BYTES) return { kind: 'invalid' };
+    let value;
+    try { value = JSON.parse(await readFile(file, 'utf8')); }
+    catch { return { kind: 'corrupt' }; }
+    const parsed = workspaceSchema.safeParse(value);
+    if (!parsed.success) return { kind: 'invalid' };
+    return {
+      kind: 'valid',
+      directory: resolve(parsed.data.directory ?? join(this.home, DEFAULT_DIRECTORY)),
+      configured: parsed.data.directory !== undefined,
+      // Old settings predate the switch: keep them ON as before.
+      enabled: parsed.data.enabled ?? true,
+    };
+  }
+
   // The configured workspace (home/sdd when nothing is configured yet). Reading
   // an invalid configuration is an error: it never silently falls back to the
   // default directory, so documents can never be written to an unexpected root.
   async #config() {
-    const file = join(this.home, WORKSPACE_FILE);
-    const info = await lstatOrNull(file);
-    if (!info) return { directory: join(this.home, DEFAULT_DIRECTORY), configured: false };
-    if (info.isSymbolicLink() || !info.isFile()) throw new SddError('SDD 工作区配置路径不安全。', 'UNSAFE_PATH');
-    if (info.size > WORKSPACE_BYTES) throw new SddError('SDD 工作区配置无效。', 'INVALID_WORKSPACE');
-    let value;
-    try { value = JSON.parse(await readFile(file, 'utf8')); }
-    catch { throw new SddError(`SDD 工作区配置损坏：${WORKSPACE_FILE} 不是有效 JSON。`, 'INVALID_WORKSPACE'); }
-    const parsed = workspaceSchema.safeParse(value);
-    if (!parsed.success) {
-      throw new SddError(`SDD 工作区配置无效：${WORKSPACE_FILE} 需要 {directory: 绝对目录}。`, 'INVALID_WORKSPACE');
+    const raw = await this.#readConfig();
+    if (raw.kind === 'missing') {
+      return { directory: resolve(join(this.home, DEFAULT_DIRECTORY)), configured: false, enabled: true };
     }
-    return { directory: resolve(parsed.data.directory), configured: true };
+    if (raw.kind === 'corrupt') throw new SddError(`SDD 工作区配置损坏：${WORKSPACE_FILE} 不是有效 JSON。`, 'INVALID_WORKSPACE');
+    if (raw.kind === 'invalid') {
+      throw new SddError(`SDD 工作区配置无效：${WORKSPACE_FILE} 需要 {directory: 绝对目录, enabled?: 布尔}。`, 'INVALID_WORKSPACE');
+    }
+    return raw;
   }
 
   // Resolve the workspace once per action call. Every later step receives this
   // captured root, so a configuration switch in another board cannot make one
-  // call read and write under different roots.
-  async #openWorkspace() {
-    const config = await this.#config();
+  // call read and write under different roots. Reads never create the default
+  // root; `create` is only used by document-write actions.
+  async #openWorkspace({ config: provided, create = false } = {}) {
+    const config = provided ?? await this.#config();
     let info = await lstatOrNull(config.directory);
     if (!info) {
       if (config.configured) throw new SddError('SDD 文档目录不存在，请检查工作区设置。', 'INVALID_WORKSPACE');
-      // The default home/sdd is created on demand; an explicitly configured
-      // directory is created by set_workspace and must not appear from nowhere.
+      const directory = await canonicalPath(config.directory);
+      if (!create) return { directory, id: workspaceDigest(directory), default: true, configured: false, enabled: config.enabled, exists: false };
+      // The default home/sdd is created lazily on the first document write. An
+      // explicitly configured directory is created by set_workspace instead.
       await mkdir(config.directory, { recursive: true, mode: 0o700 });
       info = await lstat(config.directory);
     }
@@ -193,12 +248,50 @@ export class SddWorkspace {
       throw new SddError('SDD 文档目录不可用，请检查工作区设置。', 'INVALID_WORKSPACE');
     }
     const directory = await realpath(config.directory);
-    return { directory, id: workspaceDigest(directory), default: !config.configured, configured: config.configured };
+    return { directory, id: workspaceDigest(directory), default: !config.configured, configured: config.configured, enabled: config.enabled, exists: true };
   }
 
   async getWorkspace() {
     const workspace = await this.#openWorkspace();
-    return { directory: workspace.directory, workspace_id: workspace.id, default: workspace.default, configured: workspace.configured };
+    return {
+      directory: workspace.directory, workspace_id: workspace.id, default: workspace.default,
+      configured: workspace.configured, enabled: workspace.enabled,
+    };
+  }
+
+  // Lightweight current state for the Hook and for restoring the board switch.
+  // This never creates the default root and never touches a document.
+  async state() {
+    const config = await this.#config();
+    const directory = await canonicalPath(config.directory);
+    return {
+      directory, workspace_id: workspaceDigest(directory), default: !config.configured,
+      configured: config.configured, enabled: config.enabled,
+    };
+  }
+
+  // The board switch is the only writer. It shares the configuration lock with
+  // set_workspace so a read-modify-write of one setting can never persist a
+  // stale copy of the other.
+  async setEnabled({ enabled }) {
+    await mkdir(this.home, { recursive: true, mode: 0o700 });
+    return this.#withConfigLock(async () => {
+      const raw = await this.#readConfig();
+      if (raw.kind !== 'valid' && raw.kind !== 'missing') {
+        throw new SddError('SDD 工作区配置损坏或无效，无法保存开关。请先在看板中重新设置 SDD 文档目录。', 'INVALID_WORKSPACE');
+      }
+      const config = raw.kind === 'valid'
+        ? raw : { directory: resolve(join(this.home, DEFAULT_DIRECTORY)), configured: false, enabled: true };
+      const directory = await canonicalPath(config.directory);
+      // A damaged configured root is still reported by get_workspace; the
+      // switch itself can always be saved so the user can stop automatic writes.
+      const next = { ...(config.configured ? { directory } : {}), enabled };
+      await atomicWrite(join(this.home, WORKSPACE_FILE), JSON.stringify(next, null, 2) + '\n');
+      return {
+        directory, workspace_id: workspaceDigest(directory), default: !config.configured,
+        configured: config.configured, enabled, changed: config.enabled !== enabled,
+      };
+    });
   }
 
   async setWorkspace({ directory: path }) {
@@ -220,19 +313,24 @@ export class SddWorkspace {
     if (!(await stat(real)).isDirectory()) throw new SddError('SDD 文档目录必须是目录。', 'INVALID_PATH');
     try { await access(real, constants.W_OK); }
     catch { throw new SddError('SDD 文档目录不可写。', 'INVALID_PATH'); }
-    let previous = null;
-    // A damaged configuration must not block repairing it by setting a new
-    // directory; reads still report the damage instead of switching silently.
-    try { previous = await this.#config(); } catch { previous = null; }
-    const alreadyConfigured = previous?.configured === true && previous.directory === real;
-    const changed = !alreadyConfigured;
-    if (changed) {
-      // Even when the chosen directory is the default one, writing the setting
-      // keeps the returned state identical to a later get_workspace call.
-      await mkdir(this.home, { recursive: true, mode: 0o700 });
-      await atomicWrite(join(this.home, WORKSPACE_FILE), JSON.stringify({ directory: real }, null, 2) + '\n');
-    }
-    return { directory: real, workspace_id: workspaceDigest(real), default: false, configured: true, changed, created };
+    await mkdir(this.home, { recursive: true, mode: 0o700 });
+    return this.#withConfigLock(async () => {
+      // A damaged configuration must not block repairing it by setting a new
+      // directory; reads still report the damage instead of switching silently.
+      // Repairing a damaged file keeps SDD OFF (never defaulting to auto-write),
+      // while a missing file keeps the legacy ON default.
+      const previous = await this.#readConfig();
+      const enabled = previous.kind === 'valid' ? previous.enabled : previous.kind === 'missing';
+      const previousDirectory = previous.kind === 'valid' && previous.configured ? previous.directory : null;
+      const alreadyConfigured = previousDirectory === real;
+      const changed = !alreadyConfigured;
+      if (changed) {
+        // Even when the chosen directory is the default one, writing the setting
+        // keeps the returned state identical to a later get_workspace call.
+        await atomicWrite(join(this.home, WORKSPACE_FILE), JSON.stringify({ directory: real, enabled }, null, 2) + '\n');
+      }
+      return { directory: real, workspace_id: workspaceDigest(real), default: false, configured: true, enabled, changed, created };
+    });
   }
 
   async #findProjectsByName(root, name) {
@@ -327,7 +425,22 @@ export class SddWorkspace {
     }, action);
   }
 
+  // One cross-process lock for the whole settings file. set_workspace and
+  // set_enabled both read-modify-write it, so sharing this lock is what stops a
+  // directory change from overwriting a concurrent switch change (or vice
+  // versa). Document writes also hold it while they re-check the switch, so a
+  // concurrent board cannot turn SDD off in the middle of an accepted write.
+  async #withConfigLock(action) {
+    return this.#withLock(join(this.home, '.sdd-workspace.lock'), {
+      unsafePath: 'SDD 配置锁路径不安全。',
+      busy: 'SDD 设置正在被其他看板保存，请稍后重试。', busyCode: 'CONFIG_BUSY',
+    }, action);
+  }
+
   async listProjects(workspace) {
+    // The default root is not created by a read; a fresh install simply lists
+    // no projects until the first document write creates the home/sdd folder.
+    if (!workspace.exists) return { projects: [] };
     const root = workspace.directory;
     const entries = await readdir(root, { withFileTypes: true });
     const projects = [];
@@ -410,21 +523,25 @@ export class SddWorkspace {
     return { project: view, tasks };
   }
 
-  async createTask(workspace, { project_id, title: name }) {
+  async createTask(workspace, { project_id, title: name, content }) {
     const { directory, view } = await this.#project(workspace, project_id);
+    // Validate the complete body before creating the task folder: a rejected
+    // size or an empty model body must leave no new task directory behind.
+    const body = content ?? taskTemplate(name);
+    if (content !== undefined && !content.trim()) throw new SddError('任务正文不能为空。', 'EMPTY_DOCUMENT');
+    const bytes = Buffer.byteLength(body, 'utf8');
+    if (bytes > MAX_DOC_BYTES) throw new SddError('任务文档超过 256 KiB 上限。', 'DOC_TOO_LARGE');
     const id = randomUUID();
     const taskDirectory = join(directory, id);
-    const content = taskTemplate(name);
-    if (Buffer.byteLength(content, 'utf8') > MAX_DOC_BYTES) throw new SddError('任务文档超过 256 KiB 上限。', 'DOC_TOO_LARGE');
     await mkdir(taskDirectory, { mode: 0o700 });
     const file = join(taskDirectory, 'task.md');
-    try { await atomicWrite(file, content); }
+    try { await atomicWrite(file, body); }
     catch (error) {
       await rm(taskDirectory, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
     const info = await stat(file);
-    return documentView({ id }, view, { file, content, bytes: Buffer.byteLength(content, 'utf8'), revision: digest(content), info });
+    return documentView({ id }, view, { file, content: body, bytes, revision: digest(body), info });
   }
 
   async readTask(workspace, { project_id, task_id }) {
@@ -452,16 +569,7 @@ export class SddWorkspace {
     });
   }
 
-  async action(input) {
-    const parsed = sddSchema.parse(input);
-    if (parsed.action === 'get_workspace') return this.getWorkspace();
-    if (parsed.action === 'set_workspace') return this.setWorkspace(parsed);
-    // Capture the root + identifier once; every step below uses this snapshot so
-    // a workspace switch mid-call can never split a read from its write.
-    const workspace = await this.#openWorkspace();
-    if (parsed.workspace_id !== workspace.id) {
-      throw new SddError('SDD 工作区已切换，请重新读取工作区后再操作；未保存的草稿仍保留在编辑器中。', 'WORKSPACE_CHANGED');
-    }
+  #dispatch(workspace, parsed) {
     switch (parsed.action) {
       case 'list_projects': return this.listProjects(workspace);
       case 'register_project': return this.registerProject(workspace, parsed);
@@ -471,6 +579,48 @@ export class SddWorkspace {
       case 'save_task': return this.saveTask(workspace, parsed);
       default: throw new SddError('不支持的文档操作。', 'INVALID_ACTION');
     }
+  }
+
+  async action(input) {
+    const parsed = sddSchema.parse(input);
+    if (parsed.action === 'get_workspace') return this.getWorkspace();
+    if (parsed.action === 'set_workspace') return this.setWorkspace(parsed);
+    if (parsed.action === 'set_enabled') return this.setEnabled(parsed);
+    if (WRITE_ACTIONS.has(parsed.action)) {
+      // The switch check and the document write share the settings lock, so a
+      // concurrent board that turns SDD off either completes before this write
+      // (which is then rejected) or starts after it (which is then allowed).
+      // Reading the switch outside the lock could let one write slip through.
+      await mkdir(this.home, { recursive: true, mode: 0o700 });
+      return this.#withConfigLock(async () => {
+        // A damaged configuration throws here instead of defaulting to ON, so
+        // automatic writes can never happen behind an unreadable switch.
+        const config = await this.#config();
+        if (!config.enabled) throw new SddError(SDD_DISABLED_MESSAGE, 'SDD_DISABLED');
+        const workspace = await this.#openWorkspace({ config, create: parsed.action !== 'save_task' });
+        if (parsed.workspace_id !== workspace.id) {
+          throw new SddError('SDD 工作区已切换，请重新读取工作区后再操作；未保存的草稿仍保留在编辑器中。', 'WORKSPACE_CHANGED');
+        }
+        return this.#dispatch(workspace, parsed);
+      });
+    }
+    // Capture the root + identifier once; every step below uses this snapshot so
+    // a workspace switch mid-call can never split a read from its write.
+    const workspace = await this.#openWorkspace();
+    if (parsed.workspace_id !== workspace.id) {
+      throw new SddError('SDD 工作区已切换，请重新读取工作区后再操作；未保存的草稿仍保留在编辑器中。', 'WORKSPACE_CHANGED');
+    }
+    return this.#dispatch(workspace, parsed);
+  }
+}
+
+// Hook-facing state read. It never creates the default root, never writes, and
+// reports a damaged configuration as disabled instead of defaulting to ON.
+export async function readSddState(home) {
+  try {
+    return await new SddWorkspace(home).state();
+  } catch (error) {
+    return { enabled: false, error: error.message };
   }
 }
 

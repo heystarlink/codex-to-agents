@@ -5,7 +5,8 @@ import vm from 'node:vm';
 
 const SOURCE = await readFile(new URL('../src/sdd-client.js', import.meta.url), 'utf8');
 const HTML = await readFile(new URL('../src/monitor.html', import.meta.url), 'utf8');
-const IDS = ['sdd', 'sdd-note', 'sdd-workspace-current', 'sdd-workspace-path', 'sdd-workspace-apply',
+const IDS = ['sdd', 'sdd-switch', 'sdd-state', 'sdd-setting-message', 'sdd-summary-meta',
+  'sdd-note', 'sdd-workspace-current', 'sdd-workspace-path', 'sdd-workspace-apply',
   'sdd-project', 'sdd-task', 'sdd-project-name', 'sdd-project-add', 'sdd-task-title', 'sdd-task-add',
   'sdd-content', 'sdd-path', 'sdd-copy', 'sdd-save', 'sdd-reload', 'sdd-dirty', 'sdd-guard',
   'sdd-guard-text', 'sdd-guard-keep', 'sdd-guard-discard', 'sdd-message'];
@@ -61,14 +62,15 @@ const revision = 'a'.repeat(64);
 const task = { id: '11111111-1111-4111-8111-111111111111', title: '任务一', path: '/home/sdd/a/task.md', revision };
 const secondTask = { id: '22222222-2222-4222-8222-222222222222', title: '任务二', path: '/home/sdd/b/task.md', revision };
 const documentBody = '# 任务一\n\n## 目标\n\n待填写\n';
-const workspaceView = { directory: '/home/sdd', workspace_id: WS, default: true, configured: false };
-const switchedWorkspace = { directory: '/new/sdd-docs', workspace_id: WS_OTHER, default: false, configured: true, changed: true };
-const docCalls = host => host.calls.filter(call => call.args.action !== 'get_workspace' && call.args.action !== 'set_workspace');
+const workspaceView = { directory: '/home/sdd', workspace_id: WS, default: true, configured: false, enabled: true };
+const switchedWorkspace = { directory: '/new/sdd-docs', workspace_id: WS_OTHER, default: false, configured: true, enabled: true, changed: true };
+const docCalls = host => host.calls.filter(call => !['get_workspace', 'set_workspace', 'set_enabled'].includes(call.args.action));
 
 function handlers(overrides = {}) {
   return {
     get_workspace: workspaceView,
     set_workspace: args => ({ ...switchedWorkspace, directory: args.directory }),
+    set_enabled: args => ({ ...workspaceView, enabled: args.enabled, changed: true }),
     list_projects: { projects: [project] },
     list_tasks: args => ({ project, tasks: args.project_id === project.id ? [task, secondTask] : [] }),
     read_task: args => ({
@@ -101,12 +103,19 @@ function draft(env, text = '# 草稿修改\n') {
   return text;
 }
 
-test('the SDD section is lazy, shows only project names, and reads the workspace before listing', async () => {
+test('the SDD switch loads on start, and the section stays lazy and shows only project names', async () => {
   const host = makeHost(handlers({ list_projects: { projects: [project, otherProject] } }));
   const env = environment(host);
-  assert.equal(host.calls.length, 0, 'nothing is loaded before the section opens');
+  await tick();
+  assert.equal(env.$('sdd').open, false, 'the section is still collapsed');
+  assert.deepEqual(host.calls.map(call => call.args.action), ['get_workspace'],
+    'only the always-visible switch state is read before the section opens');
+  assert.equal(env.$('sdd-switch').checked, true);
+  assert.equal(env.$('sdd-switch').disabled, false);
+  assert.equal(env.$('sdd-state').textContent, '已开启');
+  assert.equal(env.$('sdd-summary-meta').textContent, '共享规划与验收约定');
   await open(env);
-  assert.deepEqual(host.calls.slice(0, 2).map(call => call.args.action), ['get_workspace', 'list_projects']);
+  assert.deepEqual(host.calls.slice(0, 3).map(call => call.args.action), ['get_workspace', 'get_workspace', 'list_projects']);
   assert.ok(host.calls.some(call => call.args.action === 'list_tasks'));
   assert.ok(!host.calls.some(call => call.args.action === 'read_task'), 'opening the section must not read a document');
   assert.equal(env.$('sdd-workspace-current').textContent, '/home/sdd', 'the actual document directory is shown');
@@ -422,12 +431,31 @@ test('a failed re-read retains the draft and its unsaved state after the discard
   assert.match(env.$('sdd-message').textContent, /读取.*失败/);
 });
 
+test('a failed state read never shows the switch as ON and leaves the directory form usable for repair', async () => {
+  const host = makeHost(handlers({
+    get_workspace: () => { throw new Error('SDD 工作区配置损坏：sdd-workspace.json 不是有效 JSON。'); },
+  }));
+  const env = environment(host);
+  await tick(3);
+  assert.equal(env.$('sdd-switch').checked, false, 'an unreadable switch must not be rendered as enabled');
+  assert.equal(env.$('sdd-switch').disabled, true);
+  assert.equal(env.$('sdd-state').textContent, '不可用');
+  assert.match(env.$('sdd-setting-message').textContent, /读取 SDD 设置失败.*配置损坏/);
+  assert.match(env.$('sdd-setting-message').className, /error/);
+  assert.match(env.$('sdd-note').textContent, /设置不可用/);
+  assert.equal(env.$('sdd-workspace-apply').disabled, false, 'the directory form can repair a damaged configuration');
+  assert.equal(env.$('sdd-content').disabled, true);
+});
+
 test('the read-only monitor gets a disabled shell with a clear management hint', () => {
   const env = environment(null);
   assert.match(env.$('sdd-note').textContent, /请在 Codex 看板中管理/);
   for (const id of ['sdd-content', 'sdd-workspace-path', 'sdd-workspace-apply', 'sdd-project-add', 'sdd-save']) {
     assert.equal(env.$(id).disabled, true, id + ' is read-only in the monitor');
   }
+  assert.equal(env.$('sdd-switch').disabled, true, 'the switch cannot be changed in the read-only monitor');
+  assert.equal(env.$('sdd-state').textContent, '只读');
+  assert.match(env.$('sdd-setting-message').textContent, /仅可在 Codex 看板/);
   assert.match(env.$('sdd-message').textContent, /仅在 Codex 看板/);
   assert.ok(!/innerHTML|insertAdjacentHTML|setInterval\s*\(/.test(SOURCE), 'plain-text UI with no polling or HTML rendering');
   assert.ok(!SOURCE.includes('sdd-project-path'), 'the project form no longer asks for a code directory');
@@ -436,4 +464,137 @@ test('the read-only monitor gets a disabled shell with a clear management hint',
   assert.match(HTML, /切换后查看该目录下的文档，原目录文件保留。/);
   assert.match(SOURCE, /SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。/);
   assert.match(HTML, /SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。/);
+});
+
+test('the SDD switch sits outside the collapsible document section and is always visible', () => {
+  const switchIndex = HTML.indexOf('id="sdd-switch"');
+  const detailsIndex = HTML.indexOf('<details class="sdd" id="sdd">');
+  assert.ok(switchIndex > 0, 'the switch exists');
+  assert.ok(detailsIndex > 0, 'the document section exists');
+  assert.ok(switchIndex < detailsIndex, 'the switch is rendered before the collapsible section');
+  const detailsHtml = HTML.slice(detailsIndex, HTML.lastIndexOf('</details>'));
+  assert.ok(!detailsHtml.includes('sdd-switch'), 'the switch is not hidden inside the document details');
+  assert.match(HTML, /id="sdd-state"/);
+  assert.match(HTML, /id="sdd-setting-message"/);
+  assert.match(HTML, /id="sdd-summary-meta"/);
+  assert.match(HTML, /<section class="settings" aria-label="SDD 任务文档设置">/,
+    'the switch reuses the visible settings card styling (light/dark and narrow screens)');
+});
+
+test('turning SDD off protects an unsaved draft, then disables document actions but keeps the root form', async () => {
+  const host = makeHost(handlers());
+  const env = environment(host);
+  await loadTask(env);
+  const edited = draft(env);
+  const before = host.calls.length;
+  env.$('sdd-switch').checked = false;
+  env.$('sdd-switch').dispatch('change');
+  await tick(2);
+  assert.equal(host.calls.length, before, 'no switch save happens while the draft needs a decision');
+  assert.equal(env.$('sdd-guard').hidden, false);
+  assert.match(env.$('sdd-guard-text').textContent, /关闭 SDD 任务文档/);
+  assert.equal(env.$('sdd-content').value, edited, 'the draft is untouched by the guard');
+
+  // Keeping the draft keeps SDD on: the checkbox is restored to the saved state.
+  env.$('sdd-guard-keep').dispatch('click');
+  await tick(2);
+  assert.equal(env.$('sdd-switch').checked, true);
+  assert.equal(env.$('sdd-content').value, edited);
+  assert.equal(env.$('sdd-dirty').hidden, false);
+  assert.ok(!host.calls.some(call => call.args.action === 'set_enabled'));
+
+  // Discarding saves OFF and keeps the last read text read-only.
+  env.$('sdd-switch').checked = false;
+  env.$('sdd-switch').dispatch('change');
+  await tick(2);
+  env.$('sdd-guard-discard').dispatch('click');
+  await tick(4);
+  const off = host.calls.find(call => call.args.action === 'set_enabled');
+  assert.equal(off.args.enabled, false);
+  assert.equal(env.$('sdd-switch').checked, false);
+  assert.equal(env.$('sdd-state').textContent, '已关闭');
+  assert.equal(env.$('sdd-content').value, documentBody);
+  assert.equal(env.$('sdd-dirty').hidden, true);
+  for (const id of ['sdd-content', 'sdd-save', 'sdd-reload', 'sdd-project', 'sdd-task', 'sdd-project-add', 'sdd-task-add']) {
+    assert.equal(env.$(id).disabled, true, id + ' is disabled while SDD is off');
+  }
+  for (const id of ['sdd-workspace-path', 'sdd-workspace-apply']) {
+    assert.equal(env.$(id).disabled, false, id + ' stays usable while SDD is off');
+  }
+  assert.match(env.$('sdd-note').textContent, /已关闭/);
+  assert.match(env.$('sdd-setting-message').textContent, /已关闭/);
+  assert.match(env.$('sdd-summary-meta').textContent, /已关闭/);
+});
+
+test('a failed switch save rolls the switch back and keeps document actions usable', async () => {
+  const host = makeHost(handlers({ set_enabled: () => { throw new Error('设置暂时不可用'); } }));
+  const env = environment(host);
+  await loadTask(env);
+  env.$('sdd-switch').checked = false;
+  env.$('sdd-switch').dispatch('change');
+  await tick(4);
+  assert.equal(env.$('sdd-switch').checked, true, 'the failed save rolls back to the confirmed ON state');
+  assert.equal(env.$('sdd-state').textContent, '已开启');
+  assert.equal(env.$('sdd-setting-message').className, 'setting-message error');
+  assert.match(env.$('sdd-setting-message').textContent, /切换 SDD 开关失败.*设置暂时不可用/);
+  assert.equal(env.$('sdd-content').disabled, false, 'document actions remain usable after the rollback');
+  assert.equal(env.$('sdd-switch').disabled, false);
+});
+
+test('a board turned off elsewhere rejects the save, keeps the draft, and syncs the switch', async () => {
+  let enabled = true;
+  const base = handlers();
+  const host = makeHost({
+    ...base,
+    get_workspace: () => ({ ...workspaceView, enabled }),
+    save_task: () => {
+      enabled = false;
+      throw new Error('SDD 任务文档已关闭，未写入或创建任何文档。请由用户在 Agents 看板开启 SDD 后再操作。');
+    },
+  });
+  const env = environment(host);
+  await loadTask(env);
+  const changed = draft(env);
+  env.$('sdd-save').dispatch('click');
+  await tick(6);
+  assert.match(env.$('sdd-message').textContent, /SDD 已被关闭/);
+  assert.equal(env.$('sdd-content').value, changed, 'the unsaved draft is preserved');
+  assert.equal(env.$('sdd-dirty').hidden, false);
+  assert.equal(env.$('sdd-switch').checked, false, 'the switch syncs from get_workspace after the rejection');
+  assert.equal(env.$('sdd-state').textContent, '已关闭');
+  assert.equal(env.$('sdd-content').disabled, true);
+  assert.equal(env.$('sdd-workspace-apply').disabled, false, 'the directory setting stays usable for recovery');
+  assert.equal(host.calls.filter(call => call.args.action === 'save_task').length, 1, 'no blind retry is attempted');
+});
+
+test('re-enabling SDD persists the switch and restores document operations lazily', async () => {
+  let enabled = false;
+  let listed = false;
+  const base = handlers();
+  const host = makeHost({
+    ...base,
+    get_workspace: () => ({ ...workspaceView, enabled }),
+    set_enabled: args => { enabled = args.enabled;return { ...workspaceView, enabled, changed: true }; },
+    list_projects: () => { listed = true;return base.list_projects; },
+  });
+  const env = environment(host);
+  await tick(3);
+  assert.equal(env.$('sdd-switch').checked, false);
+  assert.equal(env.$('sdd-state').textContent, '已关闭');
+  assert.equal(listed, false, 'no document list is read while SDD is off');
+
+  // Opening the collapsed section while OFF shows the state but reads nothing.
+  await open(env);
+  assert.equal(listed, false, 'opening the section while OFF does not read documents');
+  assert.match(env.$('sdd-message').textContent, /已关闭/);
+
+  env.$('sdd-switch').checked = true;
+  env.$('sdd-switch').dispatch('change');
+  await tick(6);
+  assert.ok(host.calls.some(call => call.args.action === 'set_enabled' && call.args.enabled === true));
+  assert.equal(env.$('sdd-switch').checked, true);
+  assert.equal(env.$('sdd-state').textContent, '已开启');
+  assert.equal(listed, true, 'enabling loads the already-open section');
+  assert.equal(env.$('sdd-project').disabled, false);
+  assert.equal(env.$('sdd-setting-message').className, 'setting-message');
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MAX_DOC_BYTES, SddWorkspace, runSddAction } from '../src/sdd-workspace.mjs';
+import { MAX_DOC_BYTES, SddWorkspace, readSddState, runSddAction } from '../src/sdd-workspace.mjs';
 
 const call = (home, action) => runSddAction(home, action);
 const LEGACY_PROJECT_ID = 'aaaaaaaaaaaaaaaa';
@@ -46,17 +46,29 @@ async function legacyFixture(t) {
   return { root, home, sdd, goneCodePath, projectId: LEGACY_PROJECT_ID, taskId: LEGACY_TASK_ID };
 }
 
-test('the default workspace stays home/sdd and reports a stable directory identifier', async t => {
-  const { home } = await fixture(t);
+test('the default workspace stays home/sdd, reads no settings file, and creates no directory', async t => {
+  const { root, home } = await fixture(t);
   const workspace = await call(home, { action: 'get_workspace' });
   assert.equal(workspace.default, true);
   assert.equal(workspace.configured, false);
-  assert.equal(workspace.directory, await realpath(join(home, 'sdd')));
+  assert.equal(workspace.enabled, true, 'a missing settings file keeps the legacy ON default');
+  assert.equal(workspace.directory, join(await realpath(root), 'home', 'sdd'));
   assert.match(workspace.workspace_id, /^[a-f0-9]{16}$/);
   await assert.rejects(access(join(home, WORKSPACE_FILE)), { code: 'ENOENT' }, 'the default needs no settings file');
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 'reading the state never creates the default root');
+  await assert.rejects(access(home), { code: 'ENOENT' }, 'reading the state never creates the data directory');
 
   const again = await new SddWorkspace(home).action({ action: 'get_workspace' });
   assert.deepEqual(again, workspace, 'reconnecting keeps the same workspace identifier');
+
+  // The first document write creates the default root lazily and keeps the
+  // identifier the board already received.
+  const project = await doc(home, workspace.workspace_id, 'register_project', { name: '默认目录工程' });
+  assert.ok((await lstat(join(home, 'sdd'))).isDirectory());
+  const after = await call(home, { action: 'get_workspace' });
+  assert.equal(after.workspace_id, workspace.workspace_id);
+  assert.equal(after.directory, workspace.directory);
+  assert.equal(project.project.name, '默认目录工程');
 });
 
 test('legacy {name, path} projects keep their folder ID, task ID, content and never expose the code path', async t => {
@@ -203,19 +215,22 @@ test('selecting the default directory explicitly persists a state that matches g
   assert.equal(selected.default, false);
   assert.equal(selected.configured, true);
   assert.equal(selected.changed, true, 'the explicit selection is persisted even when it is the default path');
-  assert.deepEqual(JSON.parse(await readFile(join(home, WORKSPACE_FILE), 'utf8')), { directory: selected.directory });
+  assert.equal(selected.enabled, true);
+  assert.deepEqual(JSON.parse(await readFile(join(home, WORKSPACE_FILE), 'utf8')), { directory: selected.directory, enabled: true });
   const current = await call(home, { action: 'get_workspace' });
   assert.equal(current.directory, selected.directory);
   assert.equal(current.workspace_id, selected.workspace_id);
   assert.equal(current.default, selected.default);
   assert.equal(current.configured, selected.configured);
+  assert.equal(current.enabled, true);
 
   const again = await call(home, { action: 'set_workspace', directory: join(home, 'sdd') });
   assert.equal(again.changed, false);
+  assert.equal(again.enabled, true);
   const after = await call(home, { action: 'get_workspace' });
   assert.deepEqual(after, {
     directory: again.directory, workspace_id: again.workspace_id,
-    default: again.default, configured: again.configured,
+    default: again.default, configured: again.configured, enabled: again.enabled,
   });
 });
 
@@ -239,7 +254,7 @@ test('switching the workspace switches the document set and leaves the old direc
   assert.equal(switched.directory, await realpath(nextRoot));
   assert.equal(switched.changed, true);
   assert.notEqual(switched.workspace_id, initial.workspace_id);
-  assert.deepEqual(JSON.parse(await readFile(join(home, WORKSPACE_FILE), 'utf8')), { directory: await realpath(nextRoot) });
+  assert.deepEqual(JSON.parse(await readFile(join(home, WORKSPACE_FILE), 'utf8')), { directory: await realpath(nextRoot), enabled: true });
   assert.equal(await readFile(join(nextRoot, 'keep.txt'), 'utf8'), 'do not touch\n');
   assert.equal(await readFile(join(nextRoot, 'unrelated', 'note.md'), 'utf8'), '# unrelated\n');
 
@@ -285,6 +300,7 @@ test('invalid workspace paths and configurations are rejected instead of switchi
   assert.equal((await call(home, { action: 'get_workspace' })).default, true);
 
   const settings = join(home, WORKSPACE_FILE);
+  await mkdir(home, { recursive: true });
   await writeFile(settings, '{corrupt');
   await assert.rejects(call(home, { action: 'get_workspace' }), /配置损坏/);
   await assert.rejects(doc(home, '0'.repeat(16), 'list_projects'), /配置损坏/);
@@ -295,10 +311,13 @@ test('invalid workspace paths and configurations are rejected instead of switchi
   await writeFile(settings, JSON.stringify({ directory: join(root, 'missing-dir') }));
   await assert.rejects(call(home, { action: 'get_workspace' }), /不存在/);
 
-  // An explicit new directory repairs a damaged configuration.
+  // An explicit new directory repairs a legacy configuration whose directory is
+  // missing. The file itself is still valid, so the legacy ON default is kept.
   const repaired = await call(home, { action: 'set_workspace', directory: join(root, 'repaired-docs') });
   assert.equal(repaired.directory, await realpath(join(root, 'repaired-docs')));
-  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')), { directory: await realpath(join(root, 'repaired-docs')) });
+  assert.equal(repaired.enabled, true, 'a valid legacy setting keeps its ON default');
+  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')),
+    { directory: await realpath(join(root, 'repaired-docs')), enabled: true });
 });
 
 test('a board from an old workspace cannot write into a newly selected one even with identical IDs and revisions', async t => {
@@ -384,6 +403,46 @@ test('task documents are plain Markdown with versioned reads, atomic saves, and 
   assert.equal(persisted.revision, saved.revision);
   assert.equal((await fresh.action({ action: 'list_tasks', workspace_id: workspaceId, project_id: projectId })).tasks[0].title, '新标题');
   assert.deepEqual((await readdir(join(home, 'sdd', projectId, taskId))).sort(), ['task.md']);
+});
+
+test('create_task writes a complete plan atomically while a title-only call keeps the board template', async t => {
+  const { home, projectId, workspaceId } = await projectWithTask(t);
+  const projectDirectory = join(home, 'sdd', projectId);
+  const taskDirectories = async () => (await readdir(projectDirectory)).filter(name => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name));
+  const initial = (await taskDirectories()).length;
+
+  const plan = '# 模型完整规划\n\n## 目标\n\n保存非模板规划。\n\n## 范围\n\n只改 src/mcp.mjs。\n\n## 计划\n\n1. 读取工作区\n2. 创建文档\n\n## 验收条件\n\n- [ ] 文件内容与规划一致\n';
+  const created = await doc(home, workspaceId, 'create_task', { project_id: projectId, content: plan });
+  assert.equal(created.content, plan);
+  assert.equal(created.task.title, '模型完整规划');
+  assert.equal(await readFile(created.path, 'utf8'), plan);
+  assert.doesNotMatch(created.content, /待填写|先占位/);
+  assert.deepEqual((await readdir(join(projectDirectory, created.task.id))).sort(), ['task.md']);
+  assert.equal((await taskDirectories()).length, initial + 1);
+
+  // Supplying both fields lets complete content win over a template title.
+  const both = await doc(home, workspaceId, 'create_task', { project_id: projectId, title: '模板标题', content: plan });
+  assert.equal(both.content, plan);
+  assert.doesNotMatch(both.content, /模板标题|待填写/);
+
+  // The legacy board path is unchanged when content is omitted.
+  const template = await doc(home, workspaceId, 'create_task', { project_id: projectId, title: '看板模板' });
+  assert.match(template.content, /^# 看板模板/);
+  for (const section of ['## 目标', '## 范围', '## 计划', '## 验收条件']) assert.match(template.content, new RegExp(section));
+  assert.match(template.content, /待填写/);
+  assert.equal(await readFile(template.path, 'utf8'), template.content);
+
+  // Empty, oversized, unknown-project and extra-field requests fail before any
+  // new task folder is created.
+  const beforeRejected = (await taskDirectories()).length;
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: projectId, content: '' }), /正文不能为空/);
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: projectId, content: '  \n\t ' }), /正文不能为空/);
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: projectId, content: 'x'.repeat(MAX_DOC_BYTES + 1) }), /256 KiB/);
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: '0'.repeat(16), content: plan }), /不存在/);
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: projectId }), /标题或完整正文/);
+  await assert.rejects(doc(home, workspaceId, 'list_tasks', { project_id: projectId, content: plan }), /Unrecognized|unrecognized/i);
+  assert.equal((await taskDirectories()).length, beforeRejected, 'a rejected create_task leaves no task folder');
+  assert.equal((await doc(home, workspaceId, 'list_tasks', { project_id: projectId })).tasks.length, initial + 3);
 });
 
 test('stale revisions, concurrent saves, and external edits never overwrite silently', async t => {
@@ -496,4 +555,161 @@ test('tasks stay isolated per project and unknown projects cannot read other doc
   assert.deepEqual((await readdir(join(home, 'sdd', second.project.id))).sort(), ['project.json']);
   await access(join(home, 'sdd', projectId, taskId, 'task.md'));
   assert.ok(root);
+});
+
+test('an old {directory} setting stays ON and the switch persists independently of the root', async t => {
+  const { root, home } = await fixture(t);
+  const docs = join(root, 'legacy-docs');
+  await mkdir(docs);
+  await mkdir(home, { recursive: true });
+  const settings = join(home, WORKSPACE_FILE);
+  // Historical settings have no enabled field: the previous automatic behavior
+  // must be preserved exactly.
+  await writeFile(settings, JSON.stringify({ directory: docs }));
+  const initial = await call(home, { action: 'get_workspace' });
+  assert.equal(initial.enabled, true, 'old settings default to ON');
+  assert.equal(initial.configured, true);
+  assert.equal(initial.directory, await realpath(docs));
+
+  // Turning the switch off keeps the directory byte-for-byte and never touches
+  // its documents.
+  const off = await call(home, { action: 'set_enabled', enabled: false });
+  assert.equal(off.enabled, false);
+  assert.equal(off.directory, initial.directory);
+  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')),
+    { directory: initial.directory, enabled: false });
+
+  // Switching the root while OFF preserves the switch instead of resetting it.
+  const next = join(root, 'next-docs');
+  const switched = await call(home, { action: 'set_workspace', directory: next });
+  assert.equal(switched.enabled, false, 'set_workspace must not turn SDD back on');
+  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')),
+    { directory: await realpath(next), enabled: false });
+  assert.equal((await call(home, { action: 'get_workspace' })).enabled, false);
+
+  // Re-enabling keeps the selected root and reports the change.
+  const on = await call(home, { action: 'set_enabled', enabled: true });
+  assert.equal(on.enabled, true);
+  assert.equal(on.changed, true);
+  assert.equal(on.directory, await realpath(next));
+  const state = await call(home, { action: 'get_workspace' });
+  assert.equal(state.enabled, true);
+  assert.equal(state.directory, await realpath(next));
+});
+
+test('the switch persists on a fresh install without configuring or creating the default root', async t => {
+  const { root, home } = await fixture(t);
+  const initial = await call(home, { action: 'get_workspace' });
+  const settings = join(home, WORKSPACE_FILE);
+
+  const off = await call(home, { action: 'set_enabled', enabled: false });
+  assert.equal(off.default, true, 'the default root stays the default');
+  assert.equal(off.configured, false);
+  assert.equal(off.enabled, false);
+  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')), { enabled: false });
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 'saving the switch creates no document root');
+
+  const state = await readSddState(home);
+  assert.equal(state.enabled, false);
+  assert.equal(state.default, true);
+
+  const on = await call(home, { action: 'set_enabled', enabled: true });
+  assert.equal(on.enabled, true);
+  assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')), { enabled: true });
+  await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' }, 're-enabling creates no document root either');
+  assert.equal((await call(home, { action: 'get_workspace' })).workspace_id, initial.workspace_id);
+});
+
+test('SDD OFF refuses every document write while reads, files and the root setting stay usable', async t => {
+  const { root, home, workspaceId, projectId, taskId, task } = await projectWithTask(t);
+  const projectDirectory = join(home, 'sdd', projectId);
+  const before = (await readdir(projectDirectory)).sort();
+  const original = await readFile(task.path, 'utf8');
+
+  const off = await call(home, { action: 'set_enabled', enabled: false });
+  assert.equal(off.enabled, false);
+
+  await assert.rejects(doc(home, workspaceId, 'register_project', { name: '禁用后项目' }),
+    error => error.code === 'SDD_DISABLED' && /关闭/.test(error.message));
+  await assert.rejects(doc(home, workspaceId, 'create_task', { project_id: projectId, content: '# 不应写入\n' }),
+    error => error.code === 'SDD_DISABLED');
+  await assert.rejects(doc(home, workspaceId, 'save_task', {
+    project_id: projectId, task_id: taskId, content: '# 不应覆盖\n', revision: task.revision,
+  }), error => error.code === 'SDD_DISABLED');
+  assert.deepEqual((await readdir(projectDirectory)).sort(), before, 'a disabled switch writes no folder and no file');
+  assert.equal(await readFile(task.path, 'utf8'), original, 'the existing document is untouched');
+
+  // Reads keep working so existing documents can still be inspected.
+  const listed = await doc(home, workspaceId, 'list_tasks', { project_id: projectId });
+  assert.equal(listed.tasks.length, 1);
+  const readBack = await doc(home, workspaceId, 'read_task', { project_id: projectId, task_id: taskId });
+  assert.equal(readBack.content, original);
+
+  // The directory setting remains available and preserves OFF.
+  const next = join(root, 'off-root');
+  const switched = await call(home, { action: 'set_workspace', directory: next });
+  assert.equal(switched.enabled, false);
+  assert.equal((await call(home, { action: 'get_workspace' })).enabled, false);
+
+  // Re-enabling restores writes under the newly selected root; the old root and
+  // its files are left in place.
+  await call(home, { action: 'set_enabled', enabled: true });
+  const current = await call(home, { action: 'get_workspace' });
+  const project = await doc(home, current.workspace_id, 'register_project', { name: '重新开启项目' });
+  const created = await doc(home, current.workspace_id, 'create_task', {
+    project_id: project.project.id, content: '# 重新开启\n\n## 目标\n\n写入恢复。\n',
+  });
+  assert.equal(await readFile(created.path, 'utf8'), created.content);
+  assert.equal(await readFile(task.path, 'utf8'), original, 'the old root keeps its file');
+  assert.match(created.path, /off-root/);
+});
+
+test('concurrent root and switch saves share one lock and never overwrite each other', async t => {
+  const { root, home } = await fixture(t);
+  await call(home, { action: 'get_workspace' });
+  for (let round = 0; round < 3; round++) {
+    const target = join(root, `concurrent-${round}`);
+    const enabled = round % 2 === 0;
+    await Promise.all([
+      call(home, { action: 'set_workspace', directory: target }),
+      call(home, { action: 'set_enabled', enabled }),
+    ]);
+    const saved = JSON.parse(await readFile(join(home, WORKSPACE_FILE), 'utf8'));
+    assert.equal(saved.enabled, enabled, `round ${round}: the switch save is not lost`);
+    assert.equal(saved.directory, await realpath(target), `round ${round}: the root save is not lost`);
+    const state = await call(home, { action: 'get_workspace' });
+    assert.equal(state.enabled, enabled);
+    assert.equal(state.directory, await realpath(target));
+  }
+});
+
+test('a damaged settings file cannot write documents or default the switch to ON', async t => {
+  const { root, home } = await fixture(t);
+  await mkdir(home, { recursive: true });
+  const settings = join(home, WORKSPACE_FILE);
+  for (const raw of ['{corrupt', JSON.stringify({ path: '/tmp/elsewhere' }), JSON.stringify({ directory: 'relative/path' })]) {
+    await writeFile(settings, raw);
+    await assert.rejects(call(home, { action: 'get_workspace' }), /配置损坏|配置无效/);
+    await assert.rejects(doc(home, '0'.repeat(16), 'register_project', { name: '损坏工程' }), /配置损坏|配置无效/);
+    await assert.rejects(doc(home, '0'.repeat(16), 'create_task', { project_id: 'a'.repeat(16), content: '# x\n' }),
+      /配置损坏|配置无效/);
+    await assert.rejects(call(home, { action: 'set_enabled', enabled: true }), /损坏|无效/);
+    const state = await readSddState(home);
+    assert.equal(state.enabled, false, 'an unreadable switch is treated as OFF');
+    assert.match(state.error, /配置损坏|配置无效/);
+    await assert.rejects(access(join(home, 'sdd')), { code: 'ENOENT' },
+      'an unreadable configuration never creates the default root');
+  }
+
+  // Repairing the directory keeps SDD OFF; automatic writes require an explicit
+  // user ON after the repair.
+  const repaired = await call(home, { action: 'set_workspace', directory: join(root, 'repaired-docs') });
+  assert.equal(repaired.enabled, false);
+  assert.equal((await readSddState(home)).enabled, false);
+  await assert.rejects(doc(home, repaired.workspace_id, 'register_project', { name: '修复后项目' }),
+    error => error.code === 'SDD_DISABLED');
+  const on = await call(home, { action: 'set_enabled', enabled: true });
+  assert.equal(on.enabled, true);
+  const project = await doc(home, on.workspace_id, 'register_project', { name: '修复后项目' });
+  assert.equal(project.project.name, '修复后项目');
 });
