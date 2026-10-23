@@ -2,6 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { OrderBook } from './orders.mjs';
+import { DSH_PERMISSION_PRESETS, dshPermissionName } from './desktop.mjs';
+
+const dshPermission = z.enum(DSH_PERMISSION_PRESETS);
 
 export const delegationSchema = z.object({
   enabled: z.boolean(), executor: z.enum(['hermes', 'dsh']),
@@ -10,7 +13,17 @@ export const delegationSchema = z.object({
   // validated against that model's catalog efforts. Omitting it follows the
   // model's own default instead of pinning a stale strength.
   effort: z.string().trim().min(1).optional(),
+  // User-owned permission for newly created DSH dispatch sessions. Omitting it
+  // follows the DSH session default; the value is a native preset name, never a
+  // free-form sandbox/approval pair.
+  dsh_permission: dshPermission.optional(),
 }).strict();
+// The board may send "default" to clear a previous choice, exactly like effort.
+// Stored files keep only real preset names so a manually edited unknown value is
+// rejected instead of silently followed.
+export const delegationInputSchema = delegationSchema.extend({
+  dsh_permission: dshPermission.or(z.literal('default')).optional(),
+});
 const storedSchema = delegationSchema.extend({ updated_at: z.string().datetime().optional() });
 
 export async function readDelegation(home) {
@@ -19,16 +32,19 @@ export async function readDelegation(home) {
 }
 
 export async function saveDelegation(home, input) {
-  const parsed = delegationSchema.parse(input);
+  const parsed = delegationInputSchema.parse(input);
   // "default" means "do not pin a strength"; store no effort at all so the
   // hook and work_submit omit it and the model default applies.
   if (parsed.effort === 'default') delete parsed.effort;
+  // "default" likewise means "follow the DSH session default": store no
+  // permission field so the adapter leaves the native knobs untouched.
+  if (parsed.dsh_permission === 'default') delete parsed.dsh_permission;
   if (!parsed.route && parsed.effort) throw new Error('思考强度需要与固定模型一起保存。');
   const value = { ...parsed, updated_at: new Date().toISOString() };
   const book = new OrderBook(home);await book.open();
+  let previous;
+  try { previous = await readDelegation(home); } catch { /* A valid save can repair corrupt preferences. */ }
   if (value.route) {
-    let previous;
-    try { previous = await readDelegation(home); } catch { /* A valid save can repair corrupt preferences. */ }
     // Model and effort form one pinned selection: changing either needs a live
     // catalog check, while closing an already-valid fixed route still works
     // offline. Disabling never requires the executor to be connected.
@@ -56,8 +72,47 @@ export async function saveDelegation(home, input) {
       }
     }
   }
+  // A changed explicit permission can only be saved when the RUNNING DSH
+  // consumer advertises native permission control. An old consumer that has not
+  // loaded this adapter would otherwise ignore the value while the board showed
+  // it as effective. Unchanged values (for example closing the switch offline)
+  // stay saveable.
+  if (value.dsh_permission && previous?.dsh_permission !== value.dsh_permission) {
+    const runtime = await book.runtime(null, 'dsh');
+    if (!runtime.online) {
+      throw new Error('DSH 未连接，无法确认新会话权限控制，请连接并重新加载插件后保存。');
+    }
+    const control = runtime.snapshot?.catalog?.permission_control;
+    if (!control?.available || !Array.isArray(control.presets) || !control.presets.includes(value.dsh_permission)) {
+      throw new Error(`当前 DSH 运行插件未加载新会话权限控制，无法保存“${dshPermissionName(value.dsh_permission)}”。请重新加载 codex-to-agents 插件并重启 DSH 后再保存。`);
+    }
+  }
   await book.atomic(join(home, 'delegation.json'), value);
   return value;
+}
+
+// Model-facing work_submit must not hand a DSH task to a running consumer that
+// cannot honor the saved permission. The new adapter checks again right before
+// the prompt, but an old consumer never loaded that code, so the submission
+// path blocks first instead of letting the old end silently use DSH's default.
+export async function assertDshPermissionDispatchable(home, executor = 'dsh') {
+  if (executor !== 'dsh') return;
+  let setting;
+  try { setting = await readDelegation(home); }
+  catch { throw new Error('自动派工设置无法读取，无法确认新会话权限，已阻止 DSH 派工。请在看板重新保存设置。'); }
+  const permission = setting.dsh_permission;
+  if (!permission) return;
+  const book = new OrderBook(home);
+  let runtime;
+  try { runtime = await book.runtime(null, 'dsh'); }
+  catch (error) { throw new Error(`无法读取 DSH 运行状态，无法确认新会话权限，已阻止派工：${error.message}`); }
+  if (!runtime.online) {
+    throw new Error(`新会话权限已设置为“${dshPermissionName(permission)}”，但 DSH 当前未连接，无法确认运行插件支持该权限，已阻止派工。请连接 DSH 后重试。`);
+  }
+  const control = runtime.snapshot?.catalog?.permission_control;
+  if (!control?.available || !Array.isArray(control.presets) || !control.presets.includes(permission)) {
+    throw new Error(`新会话权限已设置为“${dshPermissionName(permission)}”，但当前 DSH 运行插件未加载权限控制（可能仍是旧版本），已阻止派工。请在 DSH 中重新加载 codex-to-agents 插件并重启 DSH 后再派工。`);
+  }
 }
 
 // The hook only supplies the user's current preference. It never submits work,

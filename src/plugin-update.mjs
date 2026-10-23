@@ -842,13 +842,19 @@ export async function findNpmCli({ node = process.execPath, env = process.env } 
 // new snapshot takes effect only after the Cordis profile's own node points at
 // it. Rewrite just that node's "name" scalar: each profile's home, providers,
 // defaultDirectory, comments and every other YAML byte stay untouched, and a
-// profile belonging to another data home is never read as a target.
+// profile belonging to another data home is never read as a target. DSH may
+// wrap a long module path in a double-quoted YAML scalar with a trailing
+// backslash, so the whole multi-line scalar span is replaced at once.
 export async function refreshDshProfile(home, module, { dshHome = join(homedir(), '.dsh') } = {}) {
   const profilesRoot = join(resolve(dshHome), 'profiles');
   let profiles;
   try { profiles = await readdir(profilesRoot); }
   catch (error) { if (error.code === 'ENOENT') return { configured: false, updated: false }; throw error; }
-  let configured = false; let updated = false;
+  const replacement = JSON.stringify(resolve(module));
+  let configured = false;
+  // Validate every target profile before writing any of them: an unrecognized
+  // scalar must leave all files untouched instead of partially rewiring one.
+  const pending = [];
   for (const name of profiles) {
     const file = join(profilesRoot, name, 'cordis.patch.yml');
     let text;
@@ -864,17 +870,81 @@ export async function refreshDshProfile(home, module, { dshHome = join(homedir()
       if (!homeValue || !await samePath(homeValue, home)) continue;
       matched = true;
       const nameField = fieldIn(lines, block, 'name');
-      if (!nameField) continue;
-      const line = lines[nameField.index];
-      const match = /^([ \t]*name:[ \t]*)(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^#\s]+)([ \t]*(?:#.*)?)$/.exec(line);
-      if (!match) continue;
-      const next = match[1] + JSON.stringify(resolve(module)) + match[2];
-      if (next !== line) { lines[nameField.index] = next; changed = true; }
+      const rewrite = nameField ? rewriteNameScalar(lines, nameField.index, replacement) : null;
+      if (!rewrite) {
+        throw Object.assign(new Error(`无法安全识别 DSH profile ${file} 的 name 模块路径，已停止更新且未修改任何配置。`), { stage: 'dsh-profile' });
+      }
+      if (rewrite.changed) changed = true;
     }
     if (matched) configured = true;
-    if (changed) { await writeFile(file, lines.join(eol)); updated = true; }
+    if (changed) pending.push({ file, text: lines.join(eol) });
   }
-  return { configured, updated };
+  await Promise.all(pending.map(({ file, text }) => writeFile(file, text)));
+  return { configured, updated: pending.length > 0 };
+}
+
+// Rewrite the name scalar beginning at `index`. Returns null when the span
+// cannot be identified safely; the caller then fails without writing anything.
+function rewriteNameScalar(lines, index, replacement) {
+  const match = /^([ \t]*name:[ \t]*)(.*)$/.exec(lines[index]);
+  if (!match) return null;
+  const prefix = match[1];
+  const value = match[2];
+  const write = (suffix, count = 1) => {
+    const next = prefix + replacement + suffix;
+    if (count === 1) {
+      if (next === lines[index]) return { changed: false };
+      lines[index] = next;
+      return { changed: true };
+    }
+    lines.splice(index, count, next);
+    return { changed: true };
+  };
+  if (value.startsWith('"')) {
+    const quoted = /^"(?:[^"\\]|\\.)*"([ \t]*(?:#.*)?)$/.exec(value);
+    if (quoted) return write(quoted[1]);
+    const folded = foldedDoubleQuotedScalar(lines, index, prefix.length);
+    return folded ? write(folded.suffix, folded.count) : null;
+  }
+  if (value.startsWith("'")) {
+    const quoted = /^'(?:[^']|'')*'([ \t]*(?:#.*)?)$/.exec(value);
+    return quoted ? write(quoted[1]) : null;
+  }
+  const plain = /^[^#\s]+([ \t]*(?:#.*)?)$/.exec(value);
+  return plain ? write(plain[1]) : null;
+}
+
+// Scan DSH's folded double-quoted form: a backslash at the end of a line folds
+// the break, and the continuation line's indentation is not part of the value.
+// Only this exact form is treated as safely rewritable.
+function foldedDoubleQuotedScalar(lines, index, valueAt) {
+  let lineIndex = index;
+  let line = lines[index].slice(valueAt);
+  let position = 1;
+  while (true) {
+    while (position < line.length) {
+      const char = line[position];
+      if (char === '\\') {
+        if (position === line.length - 1) {
+          lineIndex++;
+          if (lineIndex >= lines.length) return null;
+          line = lines[lineIndex];
+          position = 0;
+          while (position < line.length && (line[position] === ' ' || line[position] === '\t')) position++;
+          continue;
+        }
+        position += 2;
+        continue;
+      }
+      if (char === '"') {
+        const suffix = line.slice(position + 1);
+        if (!/^[ \t]*(?:#.*)?$/.test(suffix)) return null;
+        return { count: lineIndex - index + 1, suffix };
+      }
+      position++;
+    }
+    return null;
+  }
 }
 
 const OWN_NODE_LINE = /^([ \t]*)-[ \t]+id:[ \t]*(?:"codex-to-agents-desktop"|'codex-to-agents-desktop'|codex-to-agents-desktop)[ \t]*(?:#.*)?$/;

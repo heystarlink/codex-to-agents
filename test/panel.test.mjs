@@ -221,6 +221,103 @@ test('fixed model preferences validate catalog efforts, clear stale strengths, a
   assert.equal((await book.list()).length, 0);
 });
 
+test('Dsh permission preference is optional, strictly validated and cleared with "default"', async t => {
+  const home = await fixture(t);
+  const file = join(home, 'delegation.json');
+  const book = new OrderBook(home);await book.open();
+  const ALL_PRESETS = ['read-only', 'workspace-write', 'danger-full-access'];
+  const advertise = () => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(),
+    catalog: { models: [], permission_control: { available: true, presets: ALL_PRESETS } } });
+  // Old preferences without the field keep their exact meaning: follow DSH default.
+  await saveDelegation(home, { enabled: true, executor: 'dsh' });
+  let stored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal('dsh_permission' in stored, false);
+  assert.equal((await readDelegation(home)).dsh_permission, undefined);
+  // Each native preset name is stored verbatim; it is not a sandbox/approval pair.
+  for (const preset of ALL_PRESETS) {
+    await advertise();
+    await saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: preset });
+    assert.equal((await readDelegation(home)).dsh_permission, preset);
+    stored = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(stored.dsh_permission, preset);
+    assert.equal(typeof stored.dsh_permission, 'string');
+  }
+  // A changed explicit permission is rejected unless the RUNNING consumer
+  // advertises native control; an old heartbeat or offline DSH must not let the
+  // board persist a value the old end would silently ignore.
+  const pinned = await readFile(file, 'utf8');
+  await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' }), /未加载新会话权限控制/);
+  assert.equal(await readFile(file, 'utf8'), pinned);
+  await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' }), /DSH 未连接/);
+  // Unchanged values stay saveable offline, like the pinned model route.
+  await saveDelegation(home, { enabled: false, executor: 'dsh', dsh_permission: 'danger-full-access' });
+  assert.equal((await readDelegation(home)).enabled, false);
+  assert.equal((await readDelegation(home)).dsh_permission, 'danger-full-access');
+  // An explicit "default" clears the field without needing a live DSH.
+  await saveDelegation(home, { enabled: false, executor: 'dsh', dsh_permission: 'default' });
+  stored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal('dsh_permission' in stored, false);
+  // Unknown values, free-form bundles and abandoned sessions cannot be persisted.
+  const before = await readFile(file, 'utf8');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'everything' }));
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: { sandbox: 'danger-full-access', approval: 'never' } }));
+  assert.equal(await readFile(file, 'utf8'), before);
+  // Hermes may coexist with a stored DSH-only preference, but the model-facing
+  // dispatch prompt never claims it as a permission setting.
+  await advertise();
+  await saveDelegation(home, { enabled: true, executor: 'hermes', dsh_permission: 'read-only' });
+  assert.equal((await readDelegation(home)).dsh_permission, 'read-only');
+  assert.equal((await readDelegation(home)).executor, 'hermes');
+  const context = await delegationContext(home);
+  assert.match(context, /executor: "hermes"/);
+  assert.doesNotMatch(context, /dsh_permission|read-only/);
+});
+
+test('panel_settings persists the DSH permission through the in-memory app-only MCP surface', async t => {
+  // The native-backend panel test cannot spawn on this host (EPERM on the
+  // launcher hardlink), so this exercises the same tool wiring without it.
+  const home = await fixture(t);
+  const server = new McpServer({ name: 'panel-permission-test', version: '1.0' });
+  registerPanel(server, home, { snapshot: () => ({ delegation: { enabled: false, executor: 'hermes' } }) });
+  const client = new Client({ name: 'panel-permission-test', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close();await server.close(); });
+  await server.connect(a);await client.connect(b);
+  // The permission field is user-owned: this tool is app-only and the model
+  // never sees it in its tool catalog.
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools.find(tool => tool.name === 'panel_settings')._meta.ui.visibility, ['app']);
+  const book = new OrderBook(home);await book.open();
+  const advertise = () => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: {
+    models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] },
+  } });
+  await advertise();
+  const settings = input => client.callTool({ name: 'panel_settings', arguments: input });
+  const accepted = await settings({ enabled: true, executor: 'dsh', dsh_permission: 'read-only' });
+  assert.equal(accepted.isError, undefined);
+  assert.equal(accepted.structuredContent.dsh_permission, 'read-only');
+  assert.equal((await readDelegation(home)).dsh_permission, 'read-only');
+  // An unsupported value is rejected at the MCP boundary and changes nothing.
+  const rejected = await settings({ enabled: true, executor: 'dsh', dsh_permission: 'full' });
+  assert.equal(rejected.isError, true);
+  assert.equal((await readDelegation(home)).dsh_permission, 'read-only');
+  // A running old consumer cannot advertise native control, so a changed value
+  // is refused at save time instead of being stored for an end that ignores it.
+  await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+  const stale = await settings({ enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' });
+  assert.equal(stale.isError, true);
+  assert.match(stale.content[0].text, /未加载新会话权限控制/);
+  assert.equal((await readDelegation(home)).dsh_permission, 'read-only');
+  await advertise();
+  assert.equal((await settings({ enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' })).isError, undefined);
+  // "default" clears the saved field through the same tool.
+  const cleared = await settings({ enabled: true, executor: 'dsh', dsh_permission: 'default' });
+  assert.equal(cleared.structuredContent.dsh_permission, undefined);
+  assert.equal((await readDelegation(home)).dsh_permission, undefined);
+});
+
 test('panel refresh targets the stored or selected executor and returns without waiting for initialization', { timeout: 3000 }, async t => {
   const home = await fixture(t);await saveDelegation(home, { enabled: false, executor: 'dsh' });
   const refreshed = [];
@@ -265,6 +362,17 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   assert.match(contents[0].text, /ui\/initialize/);assert.match(contents[0].text, /自动派工/);
   assert.match(contents[0].text, /id="delegation-model"/);
   assert.match(contents[0].text, /id="delegation-effort"/);
+  assert.match(contents[0].text, /id="delegation-permission"/);
+  assert.match(contents[0].text, /跟随 DSH 默认/);
+  assert.match(contents[0].text, /仅可查看/);
+  assert.match(contents[0].text, /工作区内修改/);
+  assert.match(contents[0].text, /完全权限/);
+  assert.match(contents[0].text, /仅 DSH 新派工会话生效/);
+  // The new field collapses with the existing settings grid on narrow screens
+  // and keeps three balanced tracks when Hermes hides it.
+  assert.match(contents[0].text, /@media\(max-width:820px\)/);
+  assert.match(contents[0].text, /settings-fields\.no-dsh/);
+  assert.match(contents[0].text, /@media\(max-width:560px\)[\s\S]*?settings-fields/);
   assert.match(contents[0].text, /id="update"/);
   assert.match(contents[0].text, /id="update-refresh"/);
   assert.match(contents[0].text, /author: /);
@@ -289,6 +397,19 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   }
   const changed = await call('panel_settings', { enabled: true, executor: 'dsh' });
   assert.equal(changed.structuredContent.executor, 'dsh');
+  // The app-only settings tool persists the DSH permission and returns it for
+  // the board to re-read; invalid values are rejected instead of coerced.
+  // A changed explicit value requires the RUNNING consumer to advertise native
+  // permission control, so this temporary home needs a fresh heartbeat first.
+  const heartbeatBook = new OrderBook(home);await heartbeatBook.open();
+  await heartbeatBook.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: {
+    models: [], permission_control: { available: true, presets: ['read-only'] },
+  } });
+  const permission = await call('panel_settings', { enabled: true, executor: 'dsh', dsh_permission: 'read-only' });
+  assert.equal(permission.isError, undefined);
+  assert.equal(permission.structuredContent.dsh_permission, 'read-only');
+  assert.equal((await call('panel_snapshot', {})).structuredContent.delegation.dsh_permission, 'read-only');
+  assert.equal((await call('panel_settings', { enabled: true, executor: 'dsh', dsh_permission: 'full' })).isError, true);
   const second = await connect();
   assert.equal((await second.callTool({ name: 'panel_snapshot', arguments: {} })).structuredContent.delegation.enabled, true);
   assert.equal((await call('panel_settings', { enabled: true, executor: 'bad' })).isError, true);
@@ -865,6 +986,9 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   assert.match(html, /id="update"/);
   assert.match(html, /id="update-refresh"/);
   assert.match(html, /id="delegation-effort"/);
+  assert.match(html, /id="delegation-permission"/);
+  assert.match(html, /仅可查看/);
+  assert.match(html, /完全权限/);
   assert.match(html, /author: /);
   assert.match(html, /SDD 共享工作区/);
   assert.match(html, /SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。/);
@@ -885,4 +1009,22 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   const write = await fetch(dashboard.url + '/api/snapshot', { method: 'POST' });
   assert.equal(write.status, 405);
   assert.equal(await write.text(), 'Read-only monitor.');
+});
+
+test('the board shell carries the compact DSH permission picker without widening the shared layout', async () => {
+  // Read the source directly: this stays verifiable even where spawning the
+  // native MCP backend is blocked by the host environment.
+  const html = await readFile(new URL('../src/monitor.html', import.meta.url), 'utf8');
+  assert.match(html, /id="delegation-permission"/);
+  assert.match(html, /<option value="">跟随 DSH 默认<\/option>/);
+  assert.match(html, /<option value="read-only">仅可查看<\/option>/);
+  assert.match(html, /<option value="workspace-write">工作区内修改<\/option>/);
+  assert.match(html, /<option value="danger-full-access">完全权限<\/option>/);
+  assert.match(html, /仅 DSH 新派工会话生效/);
+  // Four equal tracks for DSH, three when Hermes hides the field, and the
+  // existing narrow-screen collapse rules still win.
+  assert.match(html, /\.settings-fields\{[^}]*grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
+  assert.match(html, /\.settings-fields\.no-dsh\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)\}/);
+  assert.match(html, /@media\(max-width:820px\)\{[\s\S]*?\.settings-fields,\.settings-fields\.no-dsh\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/);
+  assert.match(html, /@media\(max-width:560px\)\{[\s\S]*?\.settings-fields,\.settings-fields\.no-dsh,/);
 });

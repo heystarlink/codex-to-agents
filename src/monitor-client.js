@@ -1,6 +1,6 @@
 let fetching = false;let saving = false;let initialized = false;
 let refreshTimer;let stopped = false;let inView = true;let observer;
-let refreshModels = true;let revision = 0;let snapshot;let modelOptionsKey;let effortOptionsKey;
+let refreshModels = true;let revision = 0;let snapshot;let modelOptionsKey;let effortOptionsKey;let permissionOptionsKey;
 let currentSetting = { enabled: false, executor: 'hermes' };
 const $ = id => document.getElementById(id);
 const executorName = executor => executor === 'hermes' ? 'Hermes' : 'DSH';
@@ -16,7 +16,7 @@ const optionElements = options => options.map(([value, text, disabled]) => {
 
 function renderModels() {
   const executor = $('delegation-executor').value;
-  const runtime = snapshot?.worker.executors[executor];
+  const runtime = snapshot?.worker?.executors?.[executor];
   const models = runtime?.models ?? [];
   const selected = currentSetting.executor === executor ? routeKey(currentSetting.route) : '';
   const options = [['', `跟随 ${executorName(executor)} 默认`, false],
@@ -75,6 +75,54 @@ function updateConnection() {
   $('online-label').textContent = `${executorName(executor)} ${online ? '已连接' : '未连接'}`;
 }
 
+// The board stores a preset name, not a sandbox/approval pair: the DSH adapter
+// applies it through DSH's native permission service for NEW dispatch sessions
+// only. Hermes has no equivalent control, so the field is hidden for it and a
+// save made there leaves the DSH-only preference out entirely.
+const PERMISSION_HELP = '仅 DSH 新派工会话生效；已有任务沿用原权限。';
+// The running consumer advertises permission_control in its heartbeat. Old
+// consumers omit it; non-default choices must stay disabled instead of showing a
+// setting the running plugin would silently ignore.
+const PERMISSION_OPTIONS = [['', '跟随 DSH 默认'], ['read-only', '仅可查看'],
+  ['workspace-write', '工作区内修改'], ['danger-full-access', '完全权限']];
+function renderPermission() {
+  const executor = $('delegation-executor').value;
+  const field = $('permission-field');
+  const select = $('delegation-permission');
+  const dsh = executor === 'dsh';
+  field.hidden = !dsh;
+  // With the fourth field absent the row stays balanced instead of leaving an
+  // empty track; the responsive collapse rules cover both states.
+  const grid = $('settings-fields');
+  if (grid?.classList) grid.classList.toggle('no-dsh', !dsh);
+  if (!dsh) return;
+  const runtime = snapshot?.worker?.executors?.[executor];
+  const control = runtime?.permission_control;
+  const online = Boolean(runtime?.online);
+  const supported = online && !runtime?.catalog_error && control?.available === true;
+  const presets = supported && Array.isArray(control.presets) ? control.presets : [];
+  const saved = currentSetting.executor === 'dsh' && typeof currentSetting.dsh_permission === 'string' ? currentSetting.dsh_permission : '';
+  const options = PERMISSION_OPTIONS.map(([value, text]) => {
+    const available = value === '' || presets.includes(value);
+    const label = value && value === saved && !available ? `${text}（当前不可用）` : text;
+    return [value, label, !available];
+  });
+  const key = JSON.stringify([options, saved]);
+  if (key !== permissionOptionsKey) {
+    select.replaceChildren(...optionElements(options));
+    permissionOptionsKey = key;
+  }
+  select.value = saved;
+  select.disabled = !window.agentsHost || saving || stopped;
+  const missing = PERMISSION_OPTIONS.slice(1).filter(([value]) => !presets.includes(value)).map(([, text]) => text);
+  $('permission-help').textContent = !window.agentsHost ? '请在 Codex 的 Agents 看板中设置新会话权限。'
+    : !online ? 'DSH 未连接，无法确认新会话权限控制；暂时只能跟随默认。'
+    : runtime.catalog_error ? 'DSH 运行状态暂时不可用，无法确认权限控制；暂时只能跟随默认。'
+    : !supported ? '当前 DSH 运行插件未加载新会话权限控制（可能仍是旧版本），暂时只能跟随默认。请重新加载 codex-to-agents 插件并重启 DSH。'
+    : missing.length ? `DSH 当前未提供：${missing.join('、')}；其余权限可用。`
+    : PERMISSION_HELP;
+}
+
 function renderActivation() {
   const status = snapshot?.activation?.status ?? 'unknown';
   $('delegation-state').textContent = !currentSetting.enabled ? '已关闭' : status === 'ready' ? '已开启'
@@ -101,6 +149,7 @@ function render(data, requestRevision) {
     $('delegation-executor').value = currentSetting.executor;
     $('delegation-switch').disabled = $('delegation-executor').disabled = !window.agentsHost;
     renderModels();
+    renderPermission();
     if (currentSetting.error) {
       $('delegation-message').className = 'setting-message error';
       $('delegation-message').textContent = currentSetting.error;
@@ -124,8 +173,16 @@ async function saveSetting({ executorChanged = false } = {}) {
     const effort = $('delegation-effort').value;
     if (effort) input.effort = effort;
   }
+  if (!executorChanged && executor === 'dsh') {
+    const permission = $('delegation-permission').value;
+    // Send only when there is a choice to change or preserve: an untouched
+    // "follow DSH default" save adds no field, while clearing a saved choice
+    // sends "default" so the backend removes it. Switching executor omits the
+    // field, so the DSH-only preference is not carried across executors.
+    if (permission || currentSetting.dsh_permission) input.dsh_permission = permission || 'default';
+  }
   $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = true;
-  $('delegation-effort').disabled = true;
+  $('delegation-effort').disabled = $('delegation-permission').disabled = true;
   try {
     currentSetting = await window.agentsHost.call('panel_settings', input);
     $('delegation-message').className = 'setting-message';
@@ -138,19 +195,20 @@ async function saveSetting({ executorChanged = false } = {}) {
     $('delegation-switch').checked = currentSetting.enabled;
     $('delegation-executor').value = currentSetting.executor;
     $('delegation-switch').disabled = $('delegation-executor').disabled = stopped;
-    renderModels();updateConnection();renderActivation();
+    renderModels();renderPermission();updateConnection();renderActivation();
     if (executorChanged) { refreshModels = true; }
     void refresh();
   }
 }
 $('delegation-switch').addEventListener('change', () => void saveSetting());
 $('delegation-executor').addEventListener('change', () => {
-  renderModels();updateConnection();void saveSetting({ executorChanged: true });
+  renderModels();renderPermission();updateConnection();void saveSetting({ executorChanged: true });
 });
 // A different model means the old pinned strength no longer applies; clear it
 // before saving so the server never pairs a stale effort with a new route.
 $('delegation-model').addEventListener('change', () => { $('delegation-effort').value = '';void saveSetting(); });
 $('delegation-effort').addEventListener('change', () => void saveSetting());
+$('delegation-permission').addEventListener('change', () => void saveSetting());
 
 // Plugin updates. First-visible load requests a shared daily check; status only
 // reads cached state, manual check bypasses the daily limit. Actions start a bounded
@@ -305,7 +363,7 @@ async function refresh() {
     }
   } catch {
     if (!saving && requestRevision === revision) {
-      $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = $('delegation-effort').disabled = true;
+      $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = $('delegation-effort').disabled = $('delegation-permission').disabled = true;
       $('online-dot').className = 'dot';$('online-label').textContent = '未连接';
       $('model-help').textContent = '设置连接中断，正在重连。';
     }

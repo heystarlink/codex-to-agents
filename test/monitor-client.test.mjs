@@ -403,3 +403,107 @@ test('a blocked pending install keeps retry-apply available without offering it 
   await runTimers();
   assert.equal($('update-apply').disabled, false, 'a still-blocked recovery can be retried again');
 });
+
+test('the DSH permission picker shows only for DSH and saves native preset names', async () => {
+  let setting = { enabled: true, executor: 'dsh', dsh_permission: 'read-only' };
+  const calls = [];
+  const { $ } = await panelFixture(async (name, input) => {
+    calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
+    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
+      dsh: { online: true, models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] } },
+      hermes: { online: true, models: [] },
+    } } };
+  });
+  const field = $('permission-field');
+  const select = $('delegation-permission');
+  assert.equal(field.hidden, false);
+  assert.equal(select.value, 'read-only');
+  assert.equal(select.disabled, false);
+  assert.match($('permission-help').textContent, /仅 DSH 新派工会话生效/);
+  // Every explicit choice is saved as the native preset key, never as a pair.
+  select.value = 'danger-full-access';select.change();await settle();
+  assert.equal(setting.dsh_permission, 'danger-full-access');
+  assert.equal(select.value, 'danger-full-access');
+  // Following the DSH default sends "default" so a stale saved choice clears.
+  select.value = '';select.change();await settle();
+  assert.equal(setting.dsh_permission, 'default');
+  // Hermes hides the field and never carries the DSH-only preference over.
+  $('delegation-executor').value = 'hermes';$('delegation-executor').change();await settle();
+  assert.equal(field.hidden, true);
+  assert.deepEqual(setting, { enabled: true, executor: 'hermes' });
+  assert.ok(!calls.some(call => call.name === 'panel_settings' && call.input.executor === 'hermes' && 'dsh_permission' in call.input));
+});
+
+test('a rejected DSH permission save reverts the picker and keeps the field usable', async () => {
+  let setting = { enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' };
+  let reject = false;
+  const { $ } = await panelFixture(async (name, input) => {
+    if (name === 'panel_settings') {
+      if (reject) throw new Error('DSH 未连接，无法保存');
+      setting = JSON.parse(JSON.stringify(input));return setting;
+    }
+    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
+      dsh: { online: true, models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] } },
+    } } };
+  });
+  const select = $('delegation-permission');
+  reject = true;select.value = 'danger-full-access';select.change();await settle();
+  assert.equal(select.value, 'workspace-write', 'a failed save restores the last persisted permission');
+  assert.match($('delegation-message').textContent, /保存失败.*DSH 未连接/);
+  assert.equal(select.disabled, false, 'the picker is usable again after the failure');
+  reject = false;select.value = 'read-only';select.change();await settle();
+  assert.equal(setting.dsh_permission, 'read-only');
+});
+
+test('an old DSH consumer without permission control disables every non-default choice', async () => {
+  // The heartbeat comes from the plugin code that is actually running. An old
+  // consumer omits permission_control, so the board must not show a setting the
+  // old end would silently ignore; only the DSH default stays selectable.
+  let setting = { enabled: true, executor: 'dsh', dsh_permission: 'danger-full-access' };
+  const calls = [];
+  const { $ } = await panelFixture(async (name, input) => {
+    calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
+    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
+      dsh: { online: true, models: [] },
+    } } };
+  });
+  const field = $('permission-field');
+  const select = $('delegation-permission');
+  assert.equal(field.hidden, false);
+  assert.deepEqual(select.children.map(option => option.value), ['', 'read-only', 'workspace-write', 'danger-full-access']);
+  assert.equal(select.children[0].disabled, false);
+  for (const option of select.children.slice(1)) assert.equal(option.disabled, true);
+  assert.equal(select.children.at(-1).textContent, '完全权限（当前不可用）');
+  assert.equal(select.value, 'danger-full-access');
+  assert.equal(select.disabled, false, 'the user can still choose the DSH default');
+  assert.match($('permission-help').textContent, /未加载新会话权限控制.*重新加载.*重启 DSH/);
+  select.value = '';select.change();await settle();
+  assert.ok(calls.some(call => call.name === 'panel_settings' && call.input.dsh_permission === 'default'));
+});
+
+test('offline or partially capable DSH consumers keep unsupported presets disabled', async () => {
+  let setting = { enabled: true, executor: 'dsh' };
+  let online = false;
+  let presets = ['read-only', 'workspace-write', 'danger-full-access'];
+  const { $, poll } = await panelFixture(async (name, input) => {
+    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
+      dsh: { online, models: [], permission_control: { available: true, presets } },
+    } } };
+  });
+  const select = $('delegation-permission');
+  // Offline: the board cannot verify the running plugin, so explicit choices
+  // stay disabled while the default remains selectable.
+  assert.equal(select.children[0].disabled, false);
+  for (const option of select.children.slice(1)) assert.equal(option.disabled, true);
+  assert.match($('permission-help').textContent, /DSH 未连接/);
+  // Reconnect with only one native preset: disable exactly the missing ones.
+  online = true;presets = ['read-only'];
+  await poll();
+  assert.equal(select.children[1].disabled, false);
+  assert.equal(select.children[2].disabled, true);
+  assert.equal(select.children[3].disabled, true);
+  assert.match($('permission-help').textContent, /未提供：工作区内修改、完全权限/);
+});

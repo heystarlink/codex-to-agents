@@ -2,7 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { OrderBook, definitions, inspectOrderId } from './orders.mjs';
-import { readDelegation } from './delegation.mjs';
+import { readDelegation, assertDshPermissionDispatchable } from './delegation.mjs';
 import { registerSddTask } from './sdd-tools.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
@@ -21,7 +21,19 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
       description: definition.text, inputSchema: definition.schema,
       annotations: { destructiveHint: definition.destructive ?? false, readOnlyHint: false, openWorldHint: true },
     }, async input => {
-      try { const order = await book.submit(kind, input);onOrder?.();return response(order); }
+      try {
+        // A saved DSH permission needs a running consumer that can apply it.
+        // Enforce that only for genuinely new work: a retry reusing an existing
+        // order_id must still reach OrderBook, which returns reused:true for the
+        // same payload and rejects a changed one. Otherwise an idempotent
+        // receipt would start failing after DSH goes offline or its capability
+        // heartbeat changes.
+        if (kind === 'work_submit') {
+          const existing = input.order_id ? await book.request(input.order_id) : null;
+          if (!existing) await assertDshPermissionDispatchable(home, input.executor ?? 'dsh');
+        }
+        const order = await book.submit(kind, input);onOrder?.();return response(order);
+      }
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
     });
   }

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
-import { delegationSchema, saveDelegation, readDelegation } from './delegation.mjs';
+import { delegationInputSchema, saveDelegation, readDelegation } from './delegation.mjs';
 
 export const PANEL_URI = 'ui://codex-to-agents/board/v3';
 // Old board pages predate the workspace fence: they send document actions with
@@ -80,7 +80,7 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
         }
         return snapshot();
       }],
-    ['panel_settings', 'Save the automatic delegation preference selected by the user in the Agents board. Does not submit or cancel work.', delegationSchema, async input => { const value = await saveDelegation(home, input);onSettings?.();return value; }],
+    ['panel_settings', 'Save the automatic delegation preference selected by the user in the Agents board. Does not submit or cancel work.', delegationInputSchema, async input => { const value = await saveDelegation(home, input);onSettings?.();return value; }],
   ]) {
     server.registerTool(name, { description, inputSchema: schema,
       annotations: { readOnlyHint: name === 'panel_snapshot', destructiveHint: false, openWorldHint: false },

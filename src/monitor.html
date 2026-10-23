@@ -50,7 +50,8 @@
     .switch:checked::before{transform:translateX(18px);border-color:var(--switch-on)}
     .switch:checked:hover:not(:disabled){border-color:var(--switch-on)}
     .switch:disabled{opacity:.55;cursor:not-allowed}
-    .settings-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:start;gap:16px;margin-top:20px;padding-top:16px;border-top:1px solid var(--rule)}
+    .settings-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));align-items:start;gap:16px;margin-top:20px;padding-top:16px;border-top:1px solid var(--rule)}
+    .settings-fields.no-dsh{grid-template-columns:repeat(3,minmax(0,1fr))}
     .field{display:grid;gap:8px;min-width:0}
     .field-label{color:var(--muted-strong);font-size:14px;font-weight:500;line-height:1.4}
     .select-wrap{position:relative;display:block;min-width:0}
@@ -134,6 +135,9 @@
     summary:focus-visible{outline-offset:-2px;border-radius:4px}
     .switch:focus-visible{outline-offset:3px}
 
+    @media(max-width:820px){
+      .settings-fields,.settings-fields.no-dsh{grid-template-columns:repeat(2,minmax(0,1fr))}
+    }
     @media(max-width:760px){
       main{padding:12px}
       .app-header{padding:12px 16px}
@@ -142,7 +146,7 @@
       .sdd>summary{padding:14px 16px}
     }
     @media(max-width:560px){
-      .settings-fields,.selector-grid,.update-facts{grid-template-columns:1fr}
+      .settings-fields,.settings-fields.no-dsh,.selector-grid,.update-facts{grid-template-columns:1fr}
       .workspace-form,.create-row{grid-template-columns:1fr}
       .update-actions .btn{flex:1 1 120px}
       .workspace-form .btn,.create-row .btn{justify-self:start;min-width:120px}
@@ -201,7 +205,7 @@
           </div>
           <input id="delegation-switch" class="switch" type="checkbox" role="switch" aria-label="自动派工" disabled>
         </div>
-        <div class="settings-fields">
+        <div class="settings-fields" id="settings-fields">
           <div class="field">
             <label class="field-label" for="delegation-executor">执行端</label>
             <div class="select-wrap"><select id="delegation-executor" disabled><option value="hermes">Hermes</option><option value="dsh">DSH</option></select></div>
@@ -214,6 +218,16 @@
             <label class="field-label" for="delegation-effort">思考强度</label>
             <div class="select-wrap"><select id="delegation-effort" aria-describedby="effort-help" disabled><option value="">跟随模型默认</option></select></div>
             <p id="effort-help" class="field-help" role="status">选择具体模型后可设置思考强度。</p>
+          </div>
+          <div class="field" id="permission-field">
+            <label class="field-label" for="delegation-permission">新会话权限</label>
+            <div class="select-wrap"><select id="delegation-permission" aria-describedby="permission-help" disabled>
+              <option value="">跟随 DSH 默认</option>
+              <option value="read-only">仅可查看</option>
+              <option value="workspace-write">工作区内修改</option>
+              <option value="danger-full-access">完全权限</option>
+            </select></div>
+            <p id="permission-help" class="field-help" role="status">仅 DSH 新派工会话生效。</p>
           </div>
         </div>
         <p id="model-help" class="model-help" role="status">正在读取可用模型…</p>

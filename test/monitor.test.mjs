@@ -92,6 +92,18 @@ test('model catalogs stay scoped to each executor, including catalog failures', 
   assert.deepEqual(executors.hermes.models, []);assert.equal(executors.hermes.catalog_error, 'unavailable');
 });
 
+test('the snapshot passes through native permission control per executor', async t => {
+  const { book, home } = await fixture(t);
+  const permission_control = { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] };
+  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [], permission_control } });
+  // An older consumer's heartbeat simply has no permission_control: the board
+  // must receive null and disable non-default choices instead of assuming it.
+  await book.runtime({ active: true, at: new Date().toISOString(), catalog: { models: [] } }, 'hermes');
+  const { executors } = (await monitorSnapshot(home)).worker;
+  assert.deepEqual(executors.dsh.permission_control, permission_control);
+  assert.equal(executors.hermes.permission_control, null);
+});
+
 test('web monitor serves the real snapshot but rejects write requests, traversal and foreign hosts', async t => {
   const { home, book } = await fixture(t);
   await book.submit('work_submit', { goal: '<script>untrusted</script>', title: 'A real row' });

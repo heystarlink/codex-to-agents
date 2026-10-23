@@ -99,7 +99,12 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
       catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
       executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, {
         online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
-        models: runtime.snapshot?.catalog?.models ?? [], catalog_error: runtime.snapshot?.catalog?.error ?? null,
+        models: runtime.snapshot?.catalog?.models ?? [],
+        // Older consumers omit this heartbeat field entirely. Keeping the raw
+        // value lets the board distinguish "not supported" from "supported but
+        // no preset available" instead of assuming the control exists.
+        permission_control: runtime.snapshot?.catalog?.permission_control ?? null,
+        catalog_error: runtime.snapshot?.catalog?.error ?? null,
       }])) },
     summary, agents: [...grouped.values()], orders: orders.slice(0, limit), warnings,
   };

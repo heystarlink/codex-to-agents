@@ -547,6 +547,73 @@ test('DSH profile refresh rewrites only our node name for the matching home', as
   assert.deepEqual(await refreshDshProfile(repo.home, nextModule, { dshHome }), { configured: true, updated: false });
 });
 
+test('DSH profile refresh replaces a DSH backslash-folded module name as one scalar span', async t => {
+  const repo = await repository(t);
+  await mkdir(repo.home, { recursive: true });
+  const dshHome = join(repo.root, 'dsh-home');
+  const profilesRoot = join(dshHome, 'profiles');
+  const nextModule = join(repo.root, '.local', 'dsh-runtime-next', 'extension.mjs');
+  const lines = [
+    '# Desktop cordis patch (fixture)',
+    '- insert:',
+    '    - id: codex-to-agents-desktop',
+    '      name: "/old/.local/dsh-r\\',
+    '        untime-dd19f49610332538/extension.mjs" # own module',
+    '      config:',
+    `        home: ${JSON.stringify(repo.home)}`,
+    '        defaultDirectory: "/custom/work"',
+    '        providers: ["profile-only-provider"]',
+    '    - id: unrelated-plugin',
+    '      name: "/plugins/unrelated.mjs"',
+    '      config:',
+    '        home: "/another-home"',
+    '# END CODEX TO AGENTS',
+    '',
+  ];
+  await mkdir(join(profilesRoot, 'desktop'), { recursive: true });
+  const file = join(profilesRoot, 'desktop', 'cordis.patch.yml');
+  await writeFile(file, lines.join('\n'));
+
+  assert.deepEqual(await refreshDshProfile(repo.home, nextModule, { dshHome }), { configured: true, updated: true });
+  const expected = [...lines.slice(0, 3), `      name: ${JSON.stringify(nextModule)} # own module`, ...lines.slice(5)].join('\n');
+  assert.equal(await readFile(file, 'utf8'), expected,
+    'the whole two-line scalar is replaced; home, providers, comments and the other node stay verbatim');
+  assert.doesNotMatch(await readFile(file, 'utf8'), /dsh-r\\\n/, 'no folded continuation line is left behind');
+  assert.deepEqual(await refreshDshProfile(repo.home, nextModule, { dshHome }), { configured: true, updated: false });
+});
+
+test('DSH profile refresh fails without writing any profile when a name scalar is unsafe', async t => {
+  const repo = await repository(t);
+  await mkdir(repo.home, { recursive: true });
+  const dshHome = join(repo.root, 'dsh-home');
+  const profilesRoot = join(dshHome, 'profiles');
+  const nextModule = join(repo.root, '.local', 'dsh-runtime-next', 'extension.mjs');
+  const profile = (nameLine, continuation) => [
+    '- insert:',
+    '    - id: codex-to-agents-desktop',
+    nameLine,
+    ...(continuation ? [continuation] : []),
+    '      config:',
+    `        home: ${JSON.stringify(repo.home)}`,
+    '        providers: ["profile-only-provider"]',
+    '',
+  ].join('\n');
+  const safe = profile('      name: "/old/.local/runtime-222/extension.mjs"');
+  // Valid YAML folding without a backslash is not the DSH-generated form the
+  // updater can prove safe; it must refuse rather than rewrite only one line.
+  const unsafe = profile('      name: "/old/.local/dsh-', '        runtime-333/extension.mjs"');
+  for (const [name, text] of [['a-safe', safe], ['z-unsafe', unsafe]]) {
+    await mkdir(join(profilesRoot, name), { recursive: true });
+    await writeFile(join(profilesRoot, name, 'cordis.patch.yml'), text);
+  }
+  const safeFile = join(profilesRoot, 'a-safe', 'cordis.patch.yml');
+  const unsafeFile = join(profilesRoot, 'z-unsafe', 'cordis.patch.yml');
+
+  await assert.rejects(refreshDshProfile(repo.home, nextModule, { dshHome }), /无法安全识别.*未修改任何配置/);
+  assert.equal(await readFile(safeFile, 'utf8'), safe, 'no earlier profile is written when a later one is unsafe');
+  assert.equal(await readFile(unsafeFile, 'utf8'), unsafe, 'the unsafe profile is left byte-identical');
+});
+
 test('npm is located explicitly so the background does not depend on PATH', async t => {
   const root = await mkdtemp(join(tmpdir(), 'cta-npm-'));
   t.after(() => rm(root, { recursive: true, force: true }));

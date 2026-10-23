@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -349,5 +349,88 @@ test('model sdd_task cannot flip the SDD switch and its writes are rejected whil
       await client.close();await server.close();
     }
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('work_submit blocks a saved DSH permission the running consumer cannot honor', async () => {
+  const home = await mkdtemp('/tmp/cw-mcp-permission-');
+  const server = await createMcp(home);
+  const client = new Client({ name: 'permission-guard-test', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a);await client.connect(b);
+    await writeFile(join(home, 'delegation.json'), JSON.stringify({ enabled: true, executor: 'dsh', dsh_permission: 'read-only' }));
+    const book = new OrderBook(home);await book.open();
+    const call = (name, args = {}) => client.callTool({ name, arguments: args });
+    const heartbeat = (extra = {}) => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] }, ...extra });
+    // An old consumer heartbeat omits permission_control. work_submit must fail
+    // instead of queuing work that the old end would execute with the default.
+    await heartbeat();
+    const blocked = await call('work_submit', { goal: 'must not queue' });
+    assert.equal(blocked.isError, true);
+    assert.match(blocked.content[0].text, /未加载权限控制.*重新加载.*重启 DSH/);
+    assert.deepEqual(await book.list(), [], 'a blocked work_submit saves no order');
+    // The same submission is accepted when the running plugin advertises the
+    // saved preset, so the guard does not block a correctly updated DSH.
+    await heartbeat({ catalog: { models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] } } });
+    const queued = await call('work_submit', { goal: 'queued with supported permission' });
+    assert.equal(queued.isError, undefined);
+    assert.equal(queued.structuredContent.status, 'queued');
+    // Offline with an explicit saved permission also blocks: a queued order
+    // could otherwise be picked up by an old consumer after reconnecting.
+    await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+    const offline = await call('work_submit', { goal: 'must not queue offline' });
+    assert.equal(offline.isError, true);
+    assert.match(offline.content[0].text, /DSH 当前未连接/);
+    // The DSH-only preference never blocks Hermes work.
+    const hermes = await call('work_submit', { executor: 'hermes', goal: 'hermes work' });
+    assert.equal(hermes.isError, undefined);
+  } finally {
+    await client.close();await server.close();await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('an existing work order stays idempotent when DSH later loses permission capability', async () => {
+  const home = await mkdtemp('/tmp/cw-mcp-permission-reuse-');
+  const server = await createMcp(home);
+  const client = new Client({ name: 'permission-reuse-test', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a);await client.connect(b);
+    await writeFile(join(home, 'delegation.json'), JSON.stringify({ enabled: true, executor: 'dsh', dsh_permission: 'read-only' }));
+    const book = new OrderBook(home);await book.open();
+    const capability = { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] };
+    await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [], permission_control: capability } });
+    const call = (name, args = {}) => client.callTool({ name, arguments: args });
+    const orderId = randomUUID();
+    const payload = { order_id: orderId, goal: 'retry-safe work' };
+    const first = await call('work_submit', payload);
+    assert.equal(first.isError, undefined);
+    assert.equal(first.structuredContent.reused, false);
+    assert.equal(first.structuredContent.status, 'queued');
+    // The order is already saved, so a retry with the same id and payload must
+    // still return the stored receipt (reused:true) after DSH goes offline
+    // instead of failing permission admission a second time.
+    await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+    const offlineRetry = await call('work_submit', payload);
+    assert.equal(offlineRetry.isError, undefined);
+    assert.equal(offlineRetry.structuredContent.reused, true);
+    assert.equal(offlineRetry.structuredContent.order_id, orderId);
+    // An old consumer heartbeat (online but without permission_control) behaves
+    // the same: the stored order is reusable and nothing is executed again.
+    await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
+    const oldConsumerRetry = await call('work_submit', payload);
+    assert.equal(oldConsumerRetry.isError, undefined);
+    assert.equal(oldConsumerRetry.structuredContent.reused, true);
+    assert.equal((await book.list()).length, 1, 'a retry never stores a second order');
+    // Reusing the id with different arguments still reaches OrderBook's
+    // parameter-conflict check; permission admission never bypasses it.
+    const conflict = await call('work_submit', { order_id: orderId, goal: 'different atomic work' });
+    assert.equal(conflict.isError, true);
+    assert.match(conflict.content[0].text, /already bound to different work/);
+    assert.equal((await book.request(orderId)).payload.goal, 'retry-safe work');
+    assert.equal((await book.list()).length, 1);
+  } finally {
+    await client.close();await server.close();await rm(home, { recursive: true, force: true });
   }
 });

@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Desktop } from '../src/desktop.mjs';
 
 test('Agent observation reports native running/idle/unloaded states without inferring from old tasks', () => {
@@ -113,10 +116,41 @@ test('a wildcard provider list follows the currently loaded DSH providers and is
       { provider: 'other', model: 'flash', name: 'Flash', efforts: ['low'], default_effort: 'low' },
     ],
     unavailable_providers: ['broken'],
+    permission_control: { available: false, presets: [] },
   });
   assert.deepEqual(queried, ['account', 'broken', 'other']);
   assert.deepEqual(await desktop.choose({ provider: 'other' }), { provider: 'other', model: 'flash', reasoningEffort: 'low' });
   await assert.rejects(desktop.choose({ provider: 'broken' }), /not available/);
+});
+
+test('the heartbeat advertises native permission control so older consumers are distinguishable', async () => {
+  const llm = {
+    listProviders: () => [{ id: 'account' }],
+    async listModels() { return [{ id: 'flash', name: 'Flash' }]; },
+    async resolveModelInfo() { return {}; },
+  };
+  const native = {
+    catalog: () => ({ options: [
+      { value: 'read-only', name: 'read-only' },
+      { value: 'workspace-write', name: 'workspace-write' },
+      { value: 'auto', name: 'auto' },
+      { value: 'danger-full-access', name: 'danger-full-access' },
+    ] }),
+    async set() {}, current() { return 'read-only'; },
+  };
+  const available = new Desktop({ llm, get: name => name === 'permissionPresets' ? native : undefined }, { providers: ['account'] });
+  assert.deepEqual((await available.describe()).permission_control,
+    { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] });
+  // A partial service (catalog only) must not be advertised as usable: the
+  // adapter also needs set() and current() to apply and verify a preset.
+  const partial = new Desktop({ llm, get: name => name === 'permissionPresets' ? { catalog: native.catalog } : undefined }, { providers: ['account'] });
+  assert.deepEqual((await partial.describe()).permission_control, { available: false, presets: [] });
+  // A plugin whose native catalog fails still loads; the board sees "unavailable"
+  // instead of assuming permission_control exists.
+  const broken = new Desktop({ llm, get: name => name === 'permissionPresets' ? { catalog() { throw new Error('unavailable'); }, async set() {}, current() {} } : undefined }, { providers: ['account'] });
+  assert.deepEqual((await broken.describe()).permission_control, { available: false, presets: [] });
+  const missing = new Desktop({ llm, get: () => undefined }, { providers: ['account'] });
+  assert.deepEqual((await missing.describe()).permission_control, { available: false, presets: [] });
 });
 
 test('wildcard routing stops new work and follow-ups once DSH unloads a provider', async () => {
@@ -159,6 +193,7 @@ test('the explicit provider allowlist is preserved and mixing it with a wildcard
   assert.deepEqual(await desktop.describe(), {
     models: [{ provider: 'account', model: 'flash', name: 'Flash', efforts: [], default_effort: null }],
     unavailable_providers: ['retired'],
+    permission_control: { available: false, presets: [] },
   });
   assert.deepEqual(await desktop.choose({}), { provider: 'account', model: 'flash' });
   await assert.rejects(desktop.choose({ provider: 'other' }), /outside/);
@@ -166,4 +201,174 @@ test('the explicit provider allowlist is preserved and mixing it with a wildcard
   desktop.allow({ provider: 'account' });
   assert.throws(() => desktop.allow({ provider: 'retired' }), /not loaded/);
   assert.throws(() => desktop.allow({ provider: 'other' }), /outside/);
+});
+
+// A saved DSH permission is a preset name, not a sandbox/approval pair. These
+// fixtures mirror the native service contract: set(session, name) records the
+// preset and both knob events, current(session) folds them back.
+const PRESET_BUNDLES = {
+  'read-only': ['read-only', 'ask'],
+  'workspace-write': ['workspace-write', 'ask'],
+  'danger-full-access': ['danger-full-access', 'never'],
+};
+
+async function permissionHome(t, delegation) {
+  const home = await mkdtemp(join(tmpdir(), 'cta-dsh-permission-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  if (delegation !== undefined) await writeFile(join(home, 'delegation.json'), typeof delegation === 'string' ? delegation : JSON.stringify(delegation));
+  return home;
+}
+
+function fakePermissionService({ presets = Object.keys(PRESET_BUNDLES), fail = {}, sequence = [] } = {}) {
+  const calls = { set: [], current: 0 };
+  return { calls, service: {
+    catalog() {
+      sequence.push('permission-catalog');
+      if (fail.catalog) throw new Error(fail.catalog);
+      return { options: presets.map(value => ({ value, name: value })) };
+    },
+    async set(session, name) {
+      sequence.push('permission-set');
+      calls.set.push(name);
+      if (fail.set) throw new Error(fail.set);
+      const [sandbox, approval] = PRESET_BUNDLES[name];
+      // Native semantics: append only the facts whose effective value differs.
+      if (session.permission?.preset !== name) session.events.push({ type: 'permission/preset', data: { preset: name } });
+      if (sandbox !== session.permission?.sandbox) session.events.push({ type: 'sandbox/mode', data: { mode: sandbox } });
+      if (approval !== session.permission?.approval) session.events.push({ type: 'approval/policy', data: { policy: approval } });
+      session.permission = { preset: name, sandbox, approval };
+    },
+    current(session) {
+      sequence.push('permission-current');
+      calls.current++;
+      if (fail.current) throw new Error(fail.current);
+      if (fail.mismatch) return 'custom';
+      return session.permission?.preset ?? 'workspace-write';
+    },
+  } };
+}
+
+function startFixture({ home, sequence = [], permission = fakePermissionService({ sequence }), failCreate } = {}) {
+  // The native service pins the composition default (workspace-write) when the
+  // session is created; the adapter must not add a permission event for it.
+  const session = { events: [], permission: { preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' } };
+  const agent = { session, ctx: { on() { return () => {}; } } };
+  const context = {
+    effect() {},
+    get(name) { if (name === 'permissionPresets') return permission?.service; },
+    agentDefaultModel: { currentSelection: () => ({ provider: 'account', model: 'flash' }) },
+    llm: {
+      listProviders: () => [{ id: 'account' }],
+      async listModels() { return [{ id: 'flash', name: 'Flash' }]; },
+      async resolveModelInfo() { return {}; },
+      async resolveCallConfig(value) { return value; },
+    },
+    agents: { get() { sequence.push('agent'); return agent; } },
+    sessionController: {
+      async create() { sequence.push('create'); if (failCreate) throw new Error(failCreate); return { sessionId: 'cw-order-1' }; },
+      async rename() { sequence.push('rename'); },
+      agents: { selectForNextRequest() { sequence.push('select'); }, async resolveAgent() { return { agent }; } },
+      async prompt() { sequence.push('prompt'); },
+    },
+    sessionQuery: { async readSession() { sequence.push('read'); return { events: session.events, session: { cwd: home } }; } },
+    workspaceRegistry: { archivedSessionIds: [] },
+  };
+  const desktop = new Desktop(context, { providers: ['account'], home, defaultDirectory: home });
+  const order = { id: 'order-1', payload: { goal: 'Do the work.', directory: home } };
+  return { desktop, order, session, sequence, permission };
+}
+
+test('each explicit DSH permission maps to its native preset before the first task message', async t => {
+  for (const preset of Object.keys(PRESET_BUNDLES)) {
+    const home = await permissionHome(t, { enabled: true, executor: 'dsh', dsh_permission: preset });
+    const { desktop, order, session, sequence, permission } = startFixture({ home });
+    const location = await desktop.start(order);
+    assert.deepEqual(location.permission, { preset, effective: preset });
+    assert.deepEqual(permission.calls.set, [preset], 'the adapter switches to the saved native preset');
+    // The permission switch is part of session creation and strictly precedes
+    // the first prompt; the returned checkpoint also precedes it.
+    const permissionAt = sequence.indexOf('permission-set');
+    assert.ok(permissionAt > sequence.indexOf('create'));
+    assert.ok(permissionAt < sequence.indexOf('select'));
+    assert.ok(permissionAt < sequence.indexOf('rename'));
+    assert.ok(permissionAt < sequence.indexOf('read'));
+    await desktop.send(order, location, order.payload.goal, 'queue');
+    assert.ok(sequence.indexOf('permission-current') < sequence.indexOf('prompt'));
+    assert.ok(sequence.lastIndexOf('permission-set') < sequence.indexOf('prompt'));
+    // The applied preset writes the native identity and both knobs, not just a
+    // UI value. Selecting the already-pinned default appends nothing.
+    assert.deepEqual(session.permission, { preset, sandbox: PRESET_BUNDLES[preset][0], approval: PRESET_BUNDLES[preset][1] });
+    if (preset === 'workspace-write') {
+      assert.equal(session.events.length, 0, 'the already-pinned native default needs no extra events');
+    } else {
+      assert.deepEqual(session.events.find(event => event.type === 'permission/preset'),
+        { type: 'permission/preset', data: { preset } });
+      assert.deepEqual(session.events.find(event => event.type === 'sandbox/mode'),
+        { type: 'sandbox/mode', data: { mode: PRESET_BUNDLES[preset][0] } });
+    }
+  }
+});
+
+test('omitting the DSH permission follows the session default and touches no native knob', async t => {
+  for (const delegation of [undefined, { enabled: true, executor: 'dsh' }]) {
+    const home = await permissionHome(t, delegation);
+    const { desktop, order, session, permission } = startFixture({ home });
+    const location = await desktop.start(order);
+    assert.equal(location.permission, undefined);
+    assert.deepEqual(permission.calls.set, []);
+    assert.equal(session.events.length, 0, 'no permission event is appended when following the DSH default');
+    assert.equal(session.permission.preset, 'workspace-write', 'the native session default is preserved');
+  }
+});
+
+test('an explicit DSH permission fails closed before creating a session when DSH cannot honor it', async t => {
+  const home = await permissionHome(t, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' });
+  // No native permission service in this DSH.
+  const missing = startFixture({ home });
+  missing.permission.service = undefined;
+  let created = false;
+  missing.desktop.context.sessionController.create = async () => { created = true; return { sessionId: 'cw-order-1' }; };
+  await assert.rejects(missing.desktop.start(missing.order), /未提供新会话权限控制/);
+  assert.equal(created, false, 'dispatch stops before a session is created');
+  // The service exists but the saved preset is not configured in this DSH.
+  const unavailable = startFixture({ home, permission: fakePermissionService({ presets: ['workspace-write', 'danger-full-access'] }) });
+  await assert.rejects(unavailable.desktop.start(unavailable.order), /未提供权限预设“仅可查看”/);
+  assert.equal(unavailable.sequence.includes('create'), false);
+});
+
+test('unknown, unparsable or non-string saved permissions also block dispatch', async t => {
+  for (const dshPermission of ['everything', null, 7, { sandbox: 'danger-full-access' }]) {
+    const unknown = await permissionHome(t, { enabled: true, executor: 'dsh', dsh_permission: dshPermission });
+    const first = startFixture({ home: unknown });
+    await assert.rejects(first.desktop.start(first.order), /不受支持/);
+    assert.equal(first.sequence.includes('create'), false);
+  }
+
+  const corrupt = await permissionHome(t, '{not json');
+  const second = startFixture({ home: corrupt });
+  await assert.rejects(second.desktop.start(second.order), /无法解析/);
+  assert.equal(second.sequence.includes('create'), false);
+});
+
+test('a native permission failure or verification mismatch blocks the first message', async t => {
+  const home = await permissionHome(t, { enabled: true, executor: 'dsh', dsh_permission: 'danger-full-access' });
+  const failed = startFixture({ home, permission: fakePermissionService({ fail: { set: 'approval service rejected the preset' } }) });
+  await assert.rejects(failed.desktop.start(failed.order), /未应用新会话权限“完全权限”/);
+  assert.ok(failed.sequence.includes('create'), 'the session exists, but work is not sent');
+  assert.equal(failed.sequence.includes('select'), false, 'model selection and rename do not continue after a failed permission');
+  assert.equal(failed.sequence.includes('prompt'), false);
+
+  const mismatch = startFixture({ home, permission: fakePermissionService({ fail: { mismatch: true } }) });
+  await assert.rejects(mismatch.desktop.start(mismatch.order), /未生效（请求“完全权限”，实际 custom）/);
+  assert.equal(mismatch.sequence.includes('prompt'), false);
+});
+
+test('follow-ups and resumed conversations never reapply the DSH permission', async t => {
+  const home = await permissionHome(t, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' });
+  const { desktop, order, session, permission } = startFixture({ home });
+  session.events.push({ type: 'model/selection', data: { provider: 'account', model: 'flash' } });
+  await desktop.send(order, { conversation_id: 'chat-existing' }, 'Continue the work.', 'queue');
+  await desktop.checkpoint('chat-existing');
+  assert.deepEqual(permission.calls.set, []);
+  assert.equal(permission.calls.current, 0);
 });

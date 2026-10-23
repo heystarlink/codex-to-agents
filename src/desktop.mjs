@@ -1,5 +1,16 @@
-import { mkdir, realpath } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { mkdir, readFile, realpath } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
+
+// DSH's base profile configures these three presets as one sandbox mode plus
+// one approval policy each. The adapter only maps the user's saved preference
+// onto that native table; omitting the field follows whatever default DSH pins
+// for a fresh session. Keeping the list here leaves the installed runtime
+// snapshot self-contained (only desktop.mjs and its siblings are copied there).
+export const DSH_PERMISSION_PRESETS = Object.freeze(['read-only', 'workspace-write', 'danger-full-access']);
+const DSH_PERMISSION_LABELS = Object.freeze({
+  'read-only': '仅可查看', 'workspace-write': '工作区内修改', 'danger-full-access': '完全权限',
+});
+export const dshPermissionName = name => DSH_PERMISSION_LABELS[name] ?? name;
 
 function claimedMessage(events, orderId) {
   const inboxes = new Map();let claimed;
@@ -57,7 +68,27 @@ export class Desktop {
         models.push(...entries);
       } catch { unavailable.push(provider); }
     }
-    return { models, unavailable_providers: unavailable };
+    return { models, unavailable_providers: unavailable, permission_control: this.permissionCapability() };
+  }
+
+  // Publish what this running plugin can offer the board. An older consumer
+  // that never loaded this adapter simply omits the field from its heartbeat;
+  // the board must then treat non-default permission choices as unavailable
+  // instead of suggesting a setting the running plugin will ignore.
+  permissionCapability() {
+    let service;
+    try { service = typeof this.context?.get === 'function' ? this.context.get('permissionPresets') : undefined; }
+    catch { service = undefined; }
+    // A service object alone is not enough: the adapter needs all three native
+    // operations, so a partial/older implementation must not be advertised.
+    if (!service || typeof service.catalog !== 'function' || typeof service.set !== 'function' || typeof service.current !== 'function') {
+      return { available: false, presets: [] };
+    }
+    try {
+      const options = service.catalog()?.options;
+      const presets = DSH_PERMISSION_PRESETS.filter(name => (options ?? []).some(option => option?.value === name));
+      return { available: presets.length > 0, presets };
+    } catch { return { available: false, presets: [] }; }
   }
 
   observe(conversationIds) {
@@ -98,8 +129,80 @@ export class Desktop {
       ...(resolved.reasoningEffort ? { reasoningEffort: resolved.reasoningEffort } : {}) };
   }
 
+  // The permission choice belongs to the user and lives beside the other board
+  // preferences. Read it fresh for each new session so a saved change applies
+  // to later dispatch sessions without touching existing ones.
+  async newSessionPermission() {
+    if (!this.settings?.home) return null;
+    let text;
+    try { text = await readFile(join(this.settings.home, 'delegation.json'), 'utf8'); }
+    catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw new Error(`自动派工设置无法读取，无法确认新会话权限，已阻止派工：${error.message}`);
+    }
+    let setting;
+    try { setting = JSON.parse(text); }
+    catch { throw new Error('自动派工设置无法解析，无法确认新会话权限，已阻止派工。请在看板重新保存设置。'); }
+    const value = setting?.dsh_permission;
+    // Only an absent field means "follow the DSH default": the adapter must not
+    // switch any knob in that case. A present-but-invalid value is explicit and
+    // must fail instead of silently following the default.
+    if (value === undefined) return null;
+    if (typeof value !== 'string' || !DSH_PERMISSION_PRESETS.includes(value)) {
+      throw new Error(`新会话权限设置值不受支持：${JSON.stringify(value)}。已阻止派工，请在看板重新选择。`);
+    }
+    return value;
+  }
+
+  permissionService() {
+    // ctx.get() reads a service without declaring a hard inject dependency, so
+    // an older DSH that lacks the permission package still loads this plugin;
+    // only an explicit user choice then fails, with a readable reason.
+    let service;
+    try { service = typeof this.context?.get === 'function' ? this.context.get('permissionPresets') : undefined; }
+    catch { service = undefined; }
+    if (!service || typeof service.set !== 'function' || typeof service.current !== 'function') {
+      throw new Error('DSH 当前未提供新会话权限控制，已阻止派工，避免以其他权限启动任务。');
+    }
+    return service;
+  }
+
+  // Resolve the native preset before the session exists: a missing capability
+  // or preset must stop dispatch instead of starting with another permission.
+  checkPermissionPreset(name) {
+    const service = this.permissionService();
+    let options;
+    try { options = service.catalog?.()?.options; }
+    catch (error) { throw new Error(`DSH 权限目录读取失败，已阻止派工：${error.message}`); }
+    if (!Array.isArray(options) || !options.some(option => option?.value === name)) {
+      throw new Error(`DSH 当前未提供权限预设“${dshPermissionName(name)}”，已阻止派工，避免以其他权限启动任务。`);
+    }
+    return service;
+  }
+
+  // Apply and verify on the fresh session before the first task message. The
+  // native service records the preset and writes both knobs; verification reads
+  // the effective value back, so a reported success is not a UI-only value.
+  async applyPermission(agent, name, service) {
+    const session = agent?.session;
+    if (!session) throw new Error('DSH 会话尚未就绪，无法应用新会话权限，已阻止派工。');
+    try { await service.set(session, name); }
+    catch (error) { throw new Error(`DSH 未应用新会话权限“${dshPermissionName(name)}”，已阻止派工：${error.message}`); }
+    let effective;
+    try { effective = service.current(session); }
+    catch (error) { throw new Error(`DSH 无法确认新会话权限，已阻止派工：${error.message}`); }
+    if (effective !== name) {
+      throw new Error(`DSH 新会话权限未生效（请求“${dshPermissionName(name)}”，实际 ${effective}），已阻止派工。`);
+    }
+    return { preset: name, effective };
+  }
+
   async start(order) {
     const input = order.payload;
+    // Read and validate the user preference before creating anything; a
+    // configured-but-unavailable permission must never fall back silently.
+    const permission = await this.newSessionPermission();
+    const permissionService = permission ? this.checkPermissionPreset(permission) : undefined;
     const route = await this.choose(input);
     const location = input.workspace_id ? { workspaceId: this.workspace(input.workspace_id).id }
       : { cwd: await this.directory(input.directory ?? this.settings.defaultDirectory, false) };
@@ -108,11 +211,13 @@ export class Desktop {
     if (created.sessionId !== sessionId) throw new Error('Desktop returned an unexpected conversation identity.');
     const agent = this.context.agents.get(sessionId);
     this.protect(agent);
+    const applied = permission ? await this.applyPermission(agent, permission, permissionService) : undefined;
     // This session-local selection avoids selectModel(), whose documented
     // behavior also saves the desktop's global default.
     this.context.sessionController.agents.selectForNextRequest(agent, route);
     await this.context.sessionController.rename({ sessionId, title: input.title ?? input.goal.slice(0, 70) });
-    return this.checkpoint(sessionId, route);
+    const checkpoint = await this.checkpoint(sessionId, route);
+    return applied ? { ...checkpoint, permission: applied } : checkpoint;
   }
 
   async checkpoint(sessionId, route) {
