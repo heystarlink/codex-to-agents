@@ -1,0 +1,13 @@
+name = "codex-to-agents-stats"
+main = "worker.mjs"
+compatibility_date = "2026-10-23"
+workers_dev = true
+
+[observability]
+enabled = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "codex-to-agents-stats"
+# Replace with the ID returned when you create your own database.
+database_id = "REPLACE_WITH_YOUR_DATABASE_ID"

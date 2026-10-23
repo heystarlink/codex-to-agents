@@ -2,6 +2,7 @@ let fetching = false;let saving = false;let initialized = false;
 let refreshTimer;let stopped = false;let inView = true;let observer;
 let refreshModels = true;let revision = 0;let snapshot;let modelOptionsKey;let effortOptionsKey;let permissionOptionsKey;
 let currentSetting = { enabled: false, executor: 'hermes' };
+let usageSetting = { enabled: false };let usageSaving = false;let usageRevision = 0;let usageSupported = false;
 const $ = id => document.getElementById(id);
 const executorName = executor => executor === 'hermes' ? 'Hermes' : 'DSH';
 const routeKey = route => route ? JSON.stringify([route.provider, route.model]) : '';
@@ -141,7 +142,31 @@ function renderActivation() {
   $('activation-message').className = 'activation-message' + (['ready', 'checking'].includes(status) ? '' : ' error');
 }
 
-function render(data, requestRevision) {
+function renderUsage() {
+  $('usage-switch').checked = usageSetting.enabled;
+  $('usage-switch').disabled = !window.agentsHost || !usageSupported || usageSaving || stopped;
+  $('usage-state').textContent = usageSetting.enabled ? '已开启' : '已关闭';
+  $('usage-message').className = 'setting-message' + (usageSetting.error ? ' error' : '');
+  $('usage-message').textContent = usageSetting.error
+    ?? (!window.agentsHost ? '请在 Codex 的 Agents 看板中设置统计开关。'
+      : !usageSupported ? '当前后台尚未提供统计设置，请重启插件后台并重新打开看板。'
+      : !usageSetting.enabled ? '默认关闭，由你决定是否开启。'
+      : (usageSetting.last_sent_day ? `上次成功上报：${usageSetting.last_sent_day}（UTC）。` : '已开启，使用插件时上报。')
+        + ' 每个 UTC 日最多尝试一次，失败当天不重试；关闭后停止后续上报。');
+}
+
+async function saveUsageChoice(enabled) {
+  if (usageSaving || !usageSupported || !window.agentsHost || stopped) return;
+  usageSaving = true;usageRevision++;$('usage-switch').disabled = true;
+  try {
+    usageSetting = await window.agentsHost.call('panel_usage', { enabled });
+  } catch {
+    usageSetting = { ...usageSetting, error: '统计设置保存失败，请重试。' };
+  } finally { usageSaving = false;renderUsage(); }
+}
+$('usage-switch').addEventListener('change', () => void saveUsageChoice($('usage-switch').checked));
+
+function render(data, requestRevision, requestUsageRevision) {
   snapshot = data;
   if (!saving && requestRevision === revision) {
     currentSetting = data.delegation;
@@ -157,6 +182,11 @@ function render(data, requestRevision) {
   }
   updateConnection();
   renderActivation();
+  if (!usageSaving && requestUsageRevision === usageRevision) {
+    usageSupported = typeof data.usage?.enabled === 'boolean';
+    usageSetting = usageSupported ? data.usage : { enabled: false };
+    renderUsage();
+  }
   if (!window.agentsHost) {
     $('delegation-message').textContent = '请在 Codex 的 Agents 看板中设置自动派工与模型。';
   }
@@ -345,14 +375,15 @@ async function refresh() {
   if (fetching || saving || stopped || document.hidden || !inView) { return; }
   fetching = true;
   const requestRevision = revision;
+  const requestUsageRevision = usageRevision;
   const args = initialized ? { executor: $('delegation-executor').value } : {};
   if (refreshModels) { args.refresh_models = true;refreshModels = false; }
   try {
-    if (window.agentsHost) { render(await window.agentsHost.call('panel_snapshot', args), requestRevision); }
+    if (window.agentsHost) { render(await window.agentsHost.call('panel_snapshot', args), requestRevision, requestUsageRevision); }
     else {
       const response = await fetch('/api/snapshot', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
       if (!response.ok) { throw new Error('HTTP ' + response.status); }
-      render(await response.json(), requestRevision);
+      render(await response.json(), requestRevision, requestUsageRevision);
     }
     initialized = true;
     // Once per page lifetime, only after a successful visible connection. The
@@ -362,6 +393,7 @@ async function refresh() {
       void loadUpdate('check_daily');
     }
   } catch {
+    if (!usageSaving && requestUsageRevision === usageRevision) $('usage-switch').disabled = true;
     if (!saving && requestRevision === revision) {
       $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = $('delegation-effort').disabled = $('delegation-permission').disabled = true;
       $('online-dot').className = 'dot';$('online-label').textContent = '未连接';
@@ -391,6 +423,7 @@ function visibilityChanged() {
 }
 function stopRefresh() {
   stopped = true;clearTimeout(refreshTimer);stopUpdatePoll();observer?.disconnect();
+  $('usage-switch').disabled = true;
 }
 document.addEventListener('visibilitychange', visibilityChanged);
 window.addEventListener('pagehide', () => { inView = false;clearTimeout(refreshTimer);clearUpdateTimer(); });

@@ -5,8 +5,9 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { backendAuth, readJson } from './backend-control.mjs';
 import { lazyHermes } from './hermes-loader.mjs';
 import { hookHealth } from './hook-health.mjs';
+import { createUsageReporter } from './usage.mjs';
 
-export async function startBackend(home) {
+export async function startBackend(home, { usageOptions } = {}) {
   home = resolve(home);
   const headers = await backendAuth(home);
   const lock = join(home, 'backend.lock');const instance = randomUUID();
@@ -27,6 +28,7 @@ export async function startBackend(home) {
   let cache;let cacheAt = 0;let reading;let readingGeneration;let generation = 0;
   const invalidate = () => { cache = null;cacheAt = 0;generation++; };
   const activation = hookHealth(home, { onChange: invalidate });
+  const usage = createUsageReporter(home, usageOptions);
   const snapshot = async () => {
     if (cache && Date.now() - cacheAt < 1000) return cache;
     if (reading && readingGeneration === generation) return reading;
@@ -62,10 +64,13 @@ export async function startBackend(home) {
       }
       if (!['/mcp', '/board'].includes(path)) { res.writeHead(404).end();return; }
       if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }).end();return; }
+      if (path === '/mcp') void usage.activity();
       const [{ createMcp }, { StreamableHTTPServerTransport }] = await Promise.all([
         import('./mcp.mjs'), import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
       ]);
-      const mcp = await createMcp(home, { panelOnly: path === '/board', snapshot, onSettings: invalidate, onPanel: () => activation.check(),
+      const mcp = await createMcp(home, { panelOnly: path === '/board', snapshot, onSettings: invalidate,
+        onPanel: () => { void usage.activity();return activation.check(); },
+        onUsage: enabled => { usage.settingsChanged(enabled);invalidate(); },
         onRuntime: async executor => {
           if (executor !== 'dsh') {
             await worker.check({ force: true });invalidate();
@@ -83,6 +88,7 @@ export async function startBackend(home) {
   });
   server.requestTimeout = 10000;server.headersTimeout = 5000;
   const close = () => closing ??= (async () => {
+    usage.close();
     await activation.close();
     await worker.close();
     await new Promise(resolve => { server.close(resolve);server.closeIdleConnections(); });
@@ -97,5 +103,5 @@ export async function startBackend(home) {
     const { rename } = await import('node:fs/promises');
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });await rename(temporary, join(home, 'backend.json'));
     return { ...value, close, worker };
-  } catch (error) { await activation.close();await worker.close();await unlink(lock);throw error; }
+  } catch (error) { usage.close();await activation.close();await worker.close();await unlink(lock);throw error; }
 }

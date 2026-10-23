@@ -319,6 +319,16 @@
           <div class="update-actions"><button id="update-refresh" class="btn" type="button" disabled>刷新状态</button><button id="update-check" class="btn" type="button" disabled>检查更新</button><button id="update-apply" class="btn primary" type="button" disabled>安装更新</button></div>
         </div>
       </details>
+    <section class="settings" aria-label="匿名使用统计设置">
+      <div class="primary-row">
+        <div class="primary-copy">
+          <h2><label for="usage-switch">发送匿名使用统计</label><span id="usage-state" class="state-chip">已关闭</span></h2>
+          <p class="settings-help">帮助改进插件，统计活跃安装数。发送到 stats.helloping.ccwu.cc，仅含随机安装 ID 和插件版本，服务端记录 UTC 日期；不含代码、提示词、路径或账号。</p>
+        </div>
+        <input id="usage-switch" class="switch" type="checkbox" role="switch" aria-label="发送匿名使用统计" aria-describedby="usage-message" disabled>
+      </div>
+      <p id="usage-message" class="setting-message" role="status">默认关闭，由你决定是否开启。</p>
+    </section>
     </div>
     <footer class="app-footer">author: <a href="https://github.com/heystarlink" target="_blank" rel="noopener noreferrer">@sneezeforever</a></footer>
   </div>

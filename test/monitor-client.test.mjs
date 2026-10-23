@@ -32,6 +32,43 @@ async function panelFixture(call, { dailyUpdate = async () => ({ status: 'idle' 
   };
 }
 
+test('usage switch defaults OFF, saves independently, rejects stale snapshots and restores failed saves', async () => {
+  let usage = { enabled: false, last_sent_day: null };let rejectSave = false;let delayNext = false;let delayed;
+  const calls = [];
+  const { $, poll } = await panelFixture(async (name, input) => {
+    if (name === 'panel_usage') {
+      calls.push(JSON.parse(JSON.stringify(input)));
+      if (rejectSave) throw new Error('network');
+      usage = { ...usage, enabled: input.enabled };return usage;
+    }
+    assert.equal(name, 'panel_snapshot');
+    const view = { usage: { ...usage }, delegation: { enabled: false, executor: 'dsh' }, worker: { executors: { dsh: { models: [] } } } };
+    if (delayNext) { delayNext = false;return new Promise(resolve => { delayed = () => resolve(view); }); }
+    return view;
+  });
+  assert.equal($('usage-switch').checked, false);assert.equal($('usage-switch').disabled, false);
+  $('usage-switch').checked = true;$('usage-switch').change();await settle();
+  assert.deepEqual(calls, [{ enabled: true }]);
+  assert.equal($('usage-state').textContent, '已开启');
+  assert.equal($('delegation-switch').checked, false, 'usage consent cannot enable delegation');
+  delayNext = true;await poll();
+  $('usage-switch').checked = false;$('usage-switch').change();await settle();
+  delayed();await settle();
+  assert.equal($('usage-switch').checked, false, 'an old ON snapshot cannot restore consent');
+  rejectSave = true;
+  $('usage-switch').checked = true;$('usage-switch').change();await settle();
+  assert.equal($('usage-switch').checked, false);
+  assert.match($('usage-message').textContent, /保存失败/);
+});
+
+test('old backend leaves usage control disabled with reload guidance', async () => {
+  const { $ } = await panelFixture(async () => ({
+    delegation: { enabled: false, executor: 'dsh' }, worker: { executors: { dsh: { models: [] } } },
+  }));
+  assert.equal($('usage-switch').disabled, true);
+  assert.match($('usage-message').textContent, /重启插件后台/);
+});
+
 test('first visible connected board requests one daily check and shows an available update while collapsed', async () => {
   let checks = 0;
   const { $, document, documentEvents, runTimers } = await panelFixture(async name => {

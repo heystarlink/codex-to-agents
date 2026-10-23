@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
 import { OrderBook } from './orders.mjs';
 import { readDelegation } from './delegation.mjs';
+import { usageStatus } from './usage.mjs';
 
 export const ACTIVE = new Set(['queued', 'dispatching', 'executing']);
 export const PROBLEMS = new Set(['failed', 'blocked', 'uncertain']);
@@ -91,7 +92,7 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
     agent.model ??= order.model;agent.provider ??= order.provider;
   }
   return {
-    generated_at: new Date(now).toISOString(), home, delegation,
+    generated_at: new Date(now).toISOString(), home, delegation, usage: await usageStatus(home),
     service: { pid: process.pid, name: process.title, rss_mib: Math.round(process.memoryUsage.rss() / 1024 / 1024) },
     worker: { online, last_seen: latest?.at ?? null,
       heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,

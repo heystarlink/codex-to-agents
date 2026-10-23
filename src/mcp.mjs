@@ -7,13 +7,13 @@ import { registerSddTask } from './sdd-tools.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
 
-export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings, onPanel } = {}) {
+export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings, onPanel, onUsage } = {}) {
   const book = new OrderBook(home);
   await book.open();
   const server = new McpServer({ name: 'codex-to-agents', version: '0.1.0' });
   if (panelOnly) {
     const { registerPanel } = await import('./panel.mjs');
-    registerPanel(server, home, { snapshot, onSettings, onRuntime, onPanel });
+    registerPanel(server, home, { snapshot, onSettings, onRuntime, onPanel, onUsage });
     return server;
   }
   for (const [kind, definition] of Object.entries(definitions)) {

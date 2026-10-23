@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
 import { delegationInputSchema, saveDelegation, readDelegation } from './delegation.mjs';
+import { saveUsageSetting } from './usage.mjs';
 
 export const PANEL_URI = 'ui://codex-to-agents/board/v3';
 // Old board pages predate the workspace fence: they send document actions with
@@ -58,7 +59,7 @@ async function buildHtml() {
     .replace('<script defer>', '<script type="module">');
 }
 
-export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel, runUpdate } = {}) {
+export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel, onUsage, runUpdate } = {}) {
   server.registerResource('agents-board', PANEL_URI, { title: 'Agents 看板', mimeType, _meta: { ui } }, async () => ({
     contents: [{ uri: PANEL_URI, mimeType, text: await panelHtml(), _meta: {
       ui, 'openai/ui': { availableDisplayModes: ['fullscreen'], preferredDisplayMode: 'fullscreen' },
@@ -90,6 +91,19 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
       catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
     });
   }
+  server.registerTool('panel_usage', {
+    title: '匿名使用统计',
+    description: 'Save the anonymous usage-statistics consent selected by the user in the Agents board. Disabled by default. Accepts only enabled; does not change delegation or SDD. App-only.',
+    inputSchema: z.object({ enabled: z.boolean() }).strict(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },
+  }, async ({ enabled }) => {
+    try {
+      const value = await saveUsageSetting(home, enabled);
+      onUsage?.(enabled);onSettings?.();
+      return result(value);
+    } catch { return { isError: true, content: [{ type: 'text', text: '统计设置保存失败，请重试。' }] }; }
+  });
   // App-only SDD workspace. This is the board's write path for a shared
   // document directory (home/sdd by default), its task.md files, and the SDD
   // on/off switch; the read-only HTTP monitor never exposes it. Loading

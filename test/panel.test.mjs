@@ -347,8 +347,8 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   };
   const client = await connect();
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map(tool => tool.name).sort(), ['open_panel', 'panel_sdd', 'panel_settings', 'panel_snapshot', 'panel_update'],
-    'the board catalog stays exactly five app-only tools');
+  assert.deepEqual(tools.map(tool => tool.name).sort(), ['open_panel', 'panel_sdd', 'panel_settings', 'panel_snapshot', 'panel_update', 'panel_usage'],
+    'the board catalog includes the user-owned usage switch');
   const opener = tools.find(tool => tool.name === 'open_panel');
   assert.equal(opener._meta.ui.resourceUri, PANEL_URI);
   assert.deepEqual(opener._meta['openai/ui'].entrypoints, [{ type: 'global' }, { type: 'thread' }]);
@@ -954,7 +954,7 @@ test('board/v3 is the only panel resource and every board metadata reference poi
   assert.ok(!resources.some(resource => resource.uri === legacyUri), 'no v1 compatibility alias is listed');
   const tools = (await client.listTools()).tools;
   assert.equal(tools.find(tool => tool.name === 'open_panel')._meta.ui.resourceUri, PANEL_URI);
-  for (const name of ['panel_snapshot', 'panel_settings', 'panel_sdd', 'panel_update']) {
+  for (const name of ['panel_snapshot', 'panel_settings', 'panel_sdd', 'panel_update', 'panel_usage']) {
     assert.equal(tools.find(tool => tool.name === name)._meta.ui.resourceUri, PANEL_URI, name);
   }
   const { contents } = await client.readResource({ uri: PANEL_URI });
