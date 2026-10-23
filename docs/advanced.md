@@ -18,6 +18,7 @@
 | `--dsh-home` | DSH 接入 | 默认 `~/.dsh` |
 | `--hermes-url` | Hermes 接入 | 默认 `http://127.0.0.1:9120`，仅支持本机 loopback Dashboard |
 | `--hermes-token-env` | Hermes 接入 | 可选，存放 Dashboard token 的环境变量名 |
+| `--qoder-executable` | Qoder 接入 | 自动在本机查找 Qoder CLI；也可传入绝对路径 |
 
 下面以 Hermes Dashboard 运行在本机 9121 端口为例：
 
@@ -26,6 +27,15 @@ node src/command.mjs enable --executor hermes \
   --hermes-url http://127.0.0.1:9121 \
   --directory "$HOME/codex-agents-demo"
 ```
+
+Qoder 接入使用 `enable --executor qoder [--qoder-executable ...] [--directory ...]`，不需要 `--provider`；`disable --executor qoder` 关闭并保留历史工作单。例如：
+
+```bash
+node src/command.mjs enable --executor qoder \
+  --directory "$HOME/codex-agents-demo"
+```
+
+若未自动找到 Qoder CLI，再加 `--qoder-executable /绝对路径/qodercli`。
 
 省略 Hermes `--provider` 时使用模型目录中的已配置提供方，任务可选择模型或使用 Hermes 当前默认模型。Hermes 自身的模型回退由 Hermes 管理。DSH 不会因提供方不可用而由本工程自动切换到其他提供方。
 
@@ -39,11 +49,11 @@ Hermes 的本地 Dashboard 临时 token 仅在内存中使用，不保存到工�
 
 看板将开关、执行端、可选模型、思考强度和当前执行端的新会话权限保存到所选数据目录的 `delegation.json`，默认关闭，默认执行端为 Hermes。固定模型保存为 `route: { provider, model }`，省略 `route` 表示跟随执行端默认；显式思考强度另存为顶层 `effort`，只与固定 `route` 一起保存。省略 `effort` 表示跟随模型默认，不显式传递强度。三端权限分别保存为顶层 `dsh_permission`、`hermes_permission`、`qoder_permission`：`dsh_permission` 只接受 `read-only`、`workspace-write`、`danger-full-access`；`hermes_permission` 只接受 `yolo`；`qoder_permission` 只接受 `accept_edits`、`dont_ask`、`auto`、`bypass_permissions`。省略某字段表示跟随该端原生默认；保存 `"default"` 只清除该端字段；保存任一端时其他端字段原样保留。设置对使用该插件和数据目录的本机 Codex 会话共享生效。
 
-模型列表来自所选执行端的模型目录。打开看板或切换执行端时，后台异步加载该端运行时；界面继续显示连接状态，DSH 的模型查询不加载 Hermes。选择固定模型时校验提供方和模型组合，离线或模型已移除时拒绝新选择；已有固定模型离线时仍可关闭派工。思考强度只使用目录为该模型返回的 `efforts`：没有 `efforts` 的目录项不虚构选项，界面禁用强度选择并说明跟随模型默认；模型没有可用强度选项时不接受显式强度。切换模型或执行端会清除不兼容的强度，已有任务沿用原会话配置。切换执行端恢复为跟随默认，已有会话保留原模型和强度。
+模型列表来自所选执行端的模型目录。Qoder 的目录来自 `qodercli --list-models`：选择固定模型时新任务传 `--model`，不选时跟随 CLI 默认且不传该参数；目录未声明思考强度时不传 `--reasoning-effort`。打开看板或切换执行端时，后台异步加载该端运行时；界面继续显示连接状态，DSH 的模型查询不加载 Hermes。选择固定模型时校验提供方和模型组合，离线或模型已移除时拒绝新选择；已有固定模型离线时仍可关闭派工。思考强度只使用目录为该模型返回的 `efforts`：没有 `efforts` 的目录项不虚构选项，界面禁用强度选择并说明跟随模型默认；模型没有可用强度选项时不接受显式强度。切换模型或执行端会清除不兼容的强度，已有任务沿用原会话配置。切换执行端恢复为跟随默认，已有会话保留原模型和强度。
 
-三个权限字段都只由看板设置，`work_submit`、`work_update` 等模型可调用接口不接受。各 adapter 只在新建派工会话时应用，续聊与追问沿用原任务记录的权限，不重新读取看板：DSH 在会话创建后、首条任务消息前通过原生 `permissionPresets` 应用对应预设并读回确认；Hermes 在 `session.create` 后、`prompt.submit` 前调用原生 `config.set {key:"yolo", session_id, value:"1"}`（默认 session 范围，绝不传 `scope=global`），要求返回 `scope:"session"` 与 `value:"1"`，并尽力用 `session.activate` 的 `info.yolo` 读回；等不到事件读回时记录 `readback:"setter-only"`，不把它当作 effective 证据。Qoder 在 spawn 时传 `--permission-mode <snake_case>`；真实 1.1.78 在写入 stdin 前不产生任何 init，因此以收到 `system/init.permissionMode` 后按 alias（`acceptEdits` 等）归一化核对为准：写 stdin 前不一致是 definite 失败，写入后不一致则终止并标记 uncertain，后续同一 stdout chunk 里的成功 result 不得覆盖该结论。保存值不受支持、原生服务缺失或应用/核对失败时，本次派工在提交任务前明确失败。
+三个权限字段都只由看板设置，`work_submit`、`work_update` 等模型可调用接口不接受。各适配器只在新建派工会话时应用，续聊与追问沿用原任务记录的权限，不重新读取看板：DSH 在会话创建后、首条任务消息前通过原生 `permissionPresets` 应用对应预设并读回确认；Hermes 在 `session.create` 后、`prompt.submit` 前写入会话级 YOLO（默认 session 范围，不写全局审批设置），要求返回 `scope:"session"` 与 `value:"1"`，并尽力通过 `session.info` 读回；等不到事件时以写入接口返回的 scope/value 为准。Qoder 在启动 CLI 时传 `--permission-mode`，并以 CLI 返回的权限模式核对；不一致会终止并把任务标记为结果不确定。保存值不受支持或原生服务缺失时，会阻止新任务。DSH、Hermes 的权限应用与核对发生在首条任务消息前；Qoder 可能在任务已交给 CLI 后才收到权限回报，核对失败时任务结果保持待核查，不自动重放。
 
-看板能力来自各执行端 consumer 心跳里的 `catalog.permission_control`：`{available, presets, options:[{value,label,description}], default, limitations, scope:"new_session"}`。旧 consumer 的心跳没有该字段时，看板只允许跟随默认并提示更新或重新加载；DSH 旧心跳只有 `presets` 时仍按旧原生列表渲染。保存新的显式权限前，后台校验当前心跳是否声明该值，旧 consumer 或离线时拒绝保存；若磁盘上已保存显式权限而当前运行端不支持，`work_submit` 会在保存工作单前明确失败。`work_update` 续会话不重读该设置。
+看板能力来自各执行端心跳中的权限能力声明。旧执行端没有该声明时，看板只允许跟随默认并提示更新或重新加载；DSH 旧心跳只有原生预设列表时仍按旧列表渲染。保存新的显式权限前，后台校验当前心跳是否声明该值，旧执行端或离线时拒绝保存；若磁盘上已保存显式权限而当前运行端不支持，`work_submit` 会在保存工作单前明确失败。`work_update` 续会话不重读该设置。
 
 插件的 `UserPromptSubmit` Hook 经用户信任后，在每条用户消息到来时读取当前设置，并给 Codex 添加本轮派工偏好。设置读取失败按关闭处理。Hook 不投递任务、不记录用户提示、不修改全局 `AGENTS.md` 或工具权限；具体是否委派由 Codex 按需求和有效指令判断。
 
@@ -95,7 +105,7 @@ SDD 任务文档开关位于看板设置区、始终可见，默认开启；旧�
 { "executor": "hermes" }
 ```
 
-Hermes 模型目录位于 `snapshot.catalog.models`。省略参数时返回两个执行端，位于 `executors.dsh` 和 `executors.hermes`。查询 Hermes 时会按需启动其消费者。
+Hermes 模型目录位于 `snapshot.catalog.models`。省略参数时返回三个执行端，位于 `executors.dsh`、`executors.hermes` 和 `executors.qoder`。查询 Hermes 或 Qoder 时会按需启动对应执行模块。
 
 模型目录每 15 秒更新一次；心跳独立于任务轮询，每 2 秒发布一次，处理慢查询时也不会误显示离线。有未结束任务时每 750 毫秒检查一次，空闲时降到 2.5 秒，同进程新提交会立即唤醒。超过 6 秒未更新显示为离线。心跳证明最近有响应，不代表任务已成功。
 
@@ -112,7 +122,7 @@ Hermes 模型目录位于 `snapshot.catalog.models`。省略参数时返回两�
 }
 ```
 
-需要选择目录、提供方或模型时，添加 `directory`、`provider`、`model` 和可选 `effort`。`directory` 为执行端可访问的绝对目录，且应已存在。省略 `executor` 的底层工具请求使用 DSH；看板里的默认执行端不会改写这个工具默认值。
+需要选择目录、提供方或模型时，添加 `directory`、`provider`、`model` 和可选 `effort`。`directory` 为执行端可访问的绝对目录，且应已存在。省略 `executor` 的底层工具请求使用 DSH；看板里的默认执行端不会改写这个工具默认值。使用 Qoder 时 `executor` 为 `qoder`，模型来自 `qodercli --list-models`；不选模型时跟随 CLI 默认，目录未声明思考强度时不传强度。
 
 读取上面的示例请求，给 `work_inspect` 传入：
 
@@ -139,16 +149,16 @@ Hermes 模型目录位于 `snapshot.catalog.models`。省略参数时返回两�
 | `action` | 行为 |
 |---|---|
 | `append` | 追问；Hermes 等前序工作单和原生会话均空闲后再投递 |
-| `interrupt` | 补充指令；Hermes 使用原生 steer，受理成功不代表执行结束 |
+| `interrupt` | 补充指令；Hermes 使用原生 steer，受理成功不代表执行结束；Qoder 不支持运行中转向 |
 | `cancel` | 请求取消当前活动；不需要 `message`，原任务状态需另行检查 |
 
 Hermes 的取消会清理原生待发消息，但本工程尚未投递的追问单仍保留。DSH 会保留原生排队消息。已经开始的工具操作不保证立即中断。
 
 ### 管理项目和聊天
 
-`workspace_control` 仅支持 DSH，提供 `list`、`register`、`rename`、`remove`。Hermes 使用任务目录，不支持 DSH 式桌面项目注册。移除 DSH 项目注册保留文件与聊天历史。
+`workspace_control` 仅支持 DSH，提供 `list`、`register`、`rename`、`remove`。Hermes 与 Qoder 使用任务目录，不支持 DSH 式桌面项目注册。移除 DSH 项目注册保留文件与聊天历史。
 
-`conversation_control` 对两个执行端均提供 `list`、`rename`、`archive`、`restore`。操作已有聊天时，使用 `work_inspect` 返回的 `conversation_id`；它与工作单编号不同。归档运行中的聊天需显式设置 `stop_running: true`。管理操作不是跨系统事务，失败后需核对是否已产生部分变更。
+`conversation_control` 对 DSH 与 Hermes 提供 `list`、`rename`、`archive`、`restore`；Qoder 没有经过验证的会话管理命令，这些操作会被明确拒绝。操作已有聊天时，使用 `work_inspect` 返回的 `conversation_id`；它与工作单编号不同。归档运行中的聊天需显式设置 `stop_running: true`。管理操作不是跨系统事务，失败后需核对是否已产生部分变更。
 
 ### 理解任务状态
 
@@ -177,7 +187,7 @@ node src/command.mjs backend stop
 
 同一数据目录的 `/mcp` 派工连接和 `/board` 看板连接共用一个 `agents-backend`。后台仅监听 `127.0.0.1`；Codex 的 `http_headers_helper` 在建立连接时确保后台已启动，并提供本机私有认证头。认证值保存在 `backend-auth.json`，权限为 `0600`，不放进 URL 或插件配置。
 
-重启复用原端口，保留工作单与原生会话。停止后台不会取消执行端已接收的任务，也不会卸载插件；之后新建 MCP 连接会按需启动后台。
+重启复用原端口，保留工作单和会话记录。DSH、Hermes 已接收的原生任务可继续运行；Qoder CLI 子进程会随消费者关闭而终止，尚未确认的结果保持待核查，不会自动重放。停止后台不会卸载插件；之后新建 MCP 连接会按需启动后台。
 
 旧 `serve` 命令保留为 stdio 到共享 HTTP 后台的轻量转发。旧命令显式传入 `--hermes-url` 时，会将该设置保存为数据目录共用的 Hermes 配置。
 
@@ -247,7 +257,15 @@ node src/command.mjs disable
 
 该命令卸载 DSH 执行插件；未启用 Hermes 时也移除派工 MCP 注册。DSH 仍需完成配置重载，未自动生效时重启 DSH。插件看板与共享后台仍可独立存在，单据、文件和备份保留。
 
-停用执行端前，可以先关闭自动派工，避免新的自动任务。需要停止已经接收的工作时，先提交取消请求并核对结果；退出消费者或停止后台不会主动取消原生任务。
+停用 Qoder：
+
+```bash
+node src/command.mjs disable --executor qoder
+```
+
+关闭 Qoder 配置并保留历史工作单，不影响终端里你自己运行的 `qodercli`。
+
+停用执行端前，可以先关闭自动派工，避免新的自动任务。需要停止已经接收的工作时，先提交取消请求并核对结果。DSH、Hermes 的原生任务可继续运行；Qoder CLI 子进程会随消费者关闭而终止，未确认结果保持待核查。
 
 ## 开发与验证
 
@@ -257,9 +275,7 @@ node src/command.mjs disable
 npm test
 ```
 
-覆盖工作单发布、幂等提交、消费者排他、恢复、模型限制、结果关联、HTTP 共享后台、stdio 转发、看板隐藏/恢复、模型偏好保存、Hook 就绪检查，以及 SDD 开关独立持久化、旧配置兼容、关闭时拒绝写入、重新开启、草稿保护与失败回滚、多看板过期写入和 Hook 的四种开关组合。2026-10-24 本机完整回归共 259 项自动测试均已通过验证：主会话单次完整运行 258/259，唯一失败的过期看板静态文案断言（权限默认项已改为按执行端动态渲染）修复后定向复跑 1/1 通过（未宣称单次完整运行 259/259；日志 `.local/permissions-main-full-tests.tap`、`.local/permissions-main-panel-recheck.tap`）；相关 145 项定向测试通过（`.local/permissions-related-tests.tap`）。定向测试覆盖思考强度选择、三端新会话权限、更新检查、快进安装与中断恢复。这不等于所有模型和客户端组合都完成业务验收。
-
-新会话权限的定向测试覆盖：三端字段独立保存/合并与 `default` 单端清除、未知或损坏配置拒绝、看板按心跳能力渲染并按当前执行端保存、切换执行端不串用；DSH 三种原生预设映射、跟随默认不写权限事件、首条任务消息前应用并读回、原生服务缺失或应用失败阻止提交；Hermes 会话级 `config.set` 的 scope/value 强校验、`session.info` 读回与 setter-only 标注、setter 拒绝时阻止提交、续聊不重设；Qoder `--help` 真实能力探测、snake_case 传参、init camelCase alias 归一化核对、写后不一致保持 uncertain 不被成功 result 覆盖、续聊重传原记录值、旧 CLI 无该选项时阻止派工；以及 `work_submit` 对旧 consumer/离线环境的明确阻止和快照依赖闭包。该组定向测试不替代 Hermes/Qoder 的完整业务实机验收。
+覆盖工作单发布与幂等提交、消费者排他、恢复、模型限制、结果关联、HTTP 共享后台、stdio 转发、看板隐藏/恢复、模型偏好与三端新会话权限保存、Hook 就绪检查、SDD 开关独立持久化与关闭时拒绝写入，以及已完成历史缓存与增量更新。Qoder 的提交、续聊、取消和错误处理由隔离 CLI 夹具验证。这不等于所有模型和客户端组合都完成业务验收。
 
 DSH 实机脚本：
 
@@ -267,7 +283,7 @@ DSH 实机脚本：
 node scripts/desktop-check.mjs
 ```
 
-脚本使用 DSH `desktop` profile 和 `deepseek-account` / `deepseek-flash`，临时加载测试执行插件并发送少量真实模型请求；如果已有本工程的消费者插件，则拒绝修改现有配置。报告保存在 `.local/latest-check.json`，结束后恢复测试插件配置。
+脚本使用 DSH `desktop` profile 和 `deepseek-account` / `deepseek-flash`，临时加载测试执行插件并发送少量真实模型请求；如果已有本工程的消费者插件，则拒绝修改现有配置。结束后恢复测试插件配置。
 
 Hermes 实机脚本：
 
@@ -275,8 +291,6 @@ Hermes 实机脚本：
 node scripts/hermes-check.mjs
 ```
 
-使用 Hermes 当前默认模型，可通过 `--provider` 和 `--model` 覆盖。在独立目录内验证文件产出、幂等重试、两条排队追问、共享连接、后台重启及聊天管理，会产生少量真实模型请求。测试聊天在结束时归档并关闭其原生运行资源，测试后台随后停止。报告保存在 `.local/latest-hermes-check.json`。
+使用 Hermes 当前默认模型，可通过 `--provider` 和 `--model` 覆盖。在独立目录内验证文件产出、幂等重试、两条排队追问、共享连接、后台重启及聊天管理，会产生少量真实模型请求。测试聊天在结束时归档并关闭其原生运行资源，测试后台随后停止。
 
-2026-10-22 最近一轮 Hermes 文件产出验收在两个已配置模型上超时，未通过完整流程验收；共享连接、按需启动、原生会话管理和后台重启另行验证通过。未证实的超时根因不作为上游故障结论。
-
-源码职责、持久化和恢复策略见[设计说明](../DESIGN.md)。正式发布前还需确定本工程许可证并审核依赖许可。
+两个实机脚本都会访问执行端并发送真实模型请求，不是离线单元测试。源码职责、持久化和恢复策略见[设计说明](../DESIGN.md)。正式发布前还需确定本工程许可证并审核依赖许可。
