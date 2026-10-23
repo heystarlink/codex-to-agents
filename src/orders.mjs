@@ -3,6 +3,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile, rename, link, unlink, chmod } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { EXECUTORS, isExecutor, runtimeFile, executorLabel } from './executors.mjs';
+import { TERMINAL, notifyOrderChanged } from './order-cache.mjs';
 
 const nonempty = z.string().trim().min(1);
 const executor = z.enum(EXECUTORS).optional();
@@ -56,7 +57,7 @@ const identifier = id => {
   return id;
 };
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-export const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'blocked']);
+export { TERMINAL };
 
 async function readJson(path, missing = null) {
   try { return JSON.parse(await readFile(path, 'utf8')); }
@@ -126,10 +127,15 @@ export class OrderBook {
       if (existing.fingerprint !== request.fingerprint) throw new Error('order_id is already bound to different work. Reuse the original arguments with this order_id, or generate a new UUID for different work.');
       reused = true;
     }
+    // Same-process consumers update their index immediately; other processes
+    // see the atomically renamed request file through their own watcher.
+    if (!reused) notifyOrderChanged(this.home, { id, request, state: { status: 'queued' } });
     return { order_id: id, reused, ...await this.inspect(id) };
   }
 
   request(id) { return readJson(join(this.requests, `${identifier(id)}.json`)); }
+
+  state(id) { return readJson(join(this.states, `${identifier(id)}.json`)); }
 
   async inspect(id) {
     const request = await this.request(id);
@@ -147,6 +153,7 @@ export class OrderBook {
     };
     delete value.kind;delete value.created_at;
     await this.atomic(join(this.states, `${identifier(id)}.json`), value);
+    notifyOrderChanged(this.home, { id, state: value });
     return value;
   }
 

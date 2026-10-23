@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { OrderBook, TERMINAL } from './orders.mjs';
 import { isExecutor, leaseFile } from './executors.mjs';
+import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
 
 async function lease(home, executor) {
   const file = join(home, leaseFile(executor));
@@ -29,15 +30,30 @@ async function lease(home, executor) {
 }
 
 export class Consumer {
-  constructor(home, desktop, { executor = 'dsh' } = {}) {
+  constructor(home, desktop, {
+    executor = 'dsh', onError = () => {}, fallbackInterval = 2500,
+    activeInterval = 750, idleInterval = 2500, heartbeatInterval = 2000,
+  } = {}) {
     if (!isExecutor(executor)) throw new Error('Unknown executor.');
     this.executor = executor;
     this.book = new OrderBook(home);
     this.desktop = desktop;
+    this.onError = onError;
+    this.fallbackInterval = fallbackInterval;
+    this.activeInterval = activeInterval;
+    this.idleInterval = idleInterval;
+    this.heartbeatInterval = heartbeatInterval;
     this.tail = Promise.resolve();
+    this.runtimeWrites = Promise.resolve();
     this.closed = false;
     this.catalog = null;
+    this.observeError = null;
+    this.sessions = null;
+    this.online = null;
     this.nextCatalog = 0;
+    this.index = null;
+    this.scheduler = null;
+    this.lastSchedulerError = null;
   }
 
   async open() {
@@ -45,23 +61,104 @@ export class Consumer {
     const stat = await lstat(this.book.home);
     if (stat.isSymbolicLink()) throw new Error('Work-order directory may not be a symlink.');
     this.release = await lease(this.book.home, this.executor);
-    // A process may have died after a side effect but before saving its reply.
-    // Mark those orders uncertain; never automatically submit them again.
     try {
+      this.index = await acquireOrderIndex(this.book.home, { fallbackInterval: this.fallbackInterval });
       await this.desktop.open?.();
-      for (const state of await this.book.list()) {
-        if (state.executor !== this.executor) continue;
-        if (state.status === 'dispatching') await this.book.transition(state.order_id, 'uncertain', {
+      await this.index.sync();
+      // A process may have died after a side effect but before saving its reply.
+      // Mark those orders uncertain; never automatically submit them again.
+      for (const state of this.index.pending(this.executor)) {
+        if (state.status !== 'dispatching') continue;
+        await this.book.transition(state.order_id, 'uncertain', {
           conversation_id: state.conversation_id ?? (this.executor === 'dsh' && state.kind === 'work_submit' ? `cw-${state.order_id}` : undefined),
           progress: 'Consumer restarted during dispatch; inspecting native history instead of replaying.',
         });
       }
-    } catch (error) { await this.release();throw error; }
+      this.online = true;
+    } catch (error) {
+      await releaseOrderIndex(this.index);
+      this.index = null;
+      await this.release();
+      throw error;
+    }
   }
 
   tick() {
     this.tail = this.tail.catch(() => {}).then(() => this.closed ? undefined : this.process());
     return this.tail;
+  }
+
+  relevantChange() {
+    if (this.closed || !this.index) return false;
+    return this.index.pending(this.executor).length > 0;
+  }
+
+  start({ activeInterval = this.activeInterval, idleInterval = this.idleInterval, heartbeatInterval = this.heartbeatInterval } = {}) {
+    if (this.scheduler || this.closed) return this;
+    this.activeInterval = activeInterval;
+    this.idleInterval = idleInterval;
+    this.scheduler = { timer: null, running: false, again: false };
+    this.unsubscribe = this.index.onChange(() => {
+      if (this.relevantChange()) this.wake();
+    });
+    // Liveness is published independently of delivery, catalog probing and
+    // native observation, so a slow adapter can never look offline.
+    this.heartbeat = setInterval(() => { void this.publishRuntime(); }, heartbeatInterval);
+    this.heartbeat.unref?.();
+    this.schedule(0);
+    return this;
+  }
+
+  schedule(delay) {
+    const scheduler = this.scheduler;
+    if (!scheduler || this.closed) return;
+    clearTimeout(scheduler.timer);
+    scheduler.timer = setTimeout(() => { scheduler.timer = null; void this.run(); }, delay);
+  }
+
+  wake() {
+    const scheduler = this.scheduler;
+    if (!scheduler || this.closed) return;
+    if (scheduler.running) { scheduler.again = true; return; }
+    this.schedule(25);
+  }
+
+  async run() {
+    const scheduler = this.scheduler;
+    if (!scheduler || this.closed) return;
+    if (scheduler.running) { scheduler.again = true; return; }
+    scheduler.running = true;
+    try {
+      await this.tick();
+      while (scheduler.again && !this.closed) {
+        scheduler.again = false;
+        await this.tick();
+      }
+      this.lastSchedulerError = null;
+    } catch (error) {
+      if (error.message !== this.lastSchedulerError) this.onError(error);
+      this.lastSchedulerError = error.message;
+    } finally {
+      scheduler.running = false;
+      if (!this.closed) this.schedule(this.index?.pending(this.executor).length ? this.activeInterval : this.idleInterval);
+    }
+  }
+
+  async publishRuntime() {
+    if (this.closed) return this.runtimeWrites;
+    const value = { protocol: 2, executor: this.executor, active: Boolean(this.online), at: new Date().toISOString(), pid: process.pid };
+    // A failed observation marks the executor offline but must not discard the
+    // last known model catalog; the error clears with the next good observation.
+    const catalog = this.catalog || this.observeError
+      ? { ...(this.catalog ?? {}), ...(this.observeError ? { error: this.observeError } : {}) }
+      : null;
+    if (catalog) value.catalog = catalog;
+    if (this.sessions) value.sessions = this.sessions;
+    this.runtimeWrites = this.runtimeWrites.catch(() => {}).then(() => {
+      if (this.closed) return;
+      return this.book.runtime(value, this.executor);
+    }).catch(() => {});
+    return this.runtimeWrites;
   }
 
   async process() {
@@ -70,26 +167,37 @@ export class Consumer {
       catch (error) { this.catalog = { error: error.message }; }
       this.nextCatalog = Date.now() + 15000;
     }
-    const orders = (await this.book.list()).filter(order => order.executor === this.executor);
+    await this.index.sync();
+    const orders = this.index.pending(this.executor);
     let sessions;
     try { sessions = await this.desktop.observe(orders.map(order => order.conversation_id).filter(Boolean)); }
     catch (error) {
-      await this.book.runtime({ protocol: 2, executor: this.executor, active: false, at: new Date().toISOString(), pid: process.pid, catalog: { error: error.message }, sessions: [] }, this.executor);
+      this.online = false;
+      this.sessions = [];
+      this.observeError = error.message;
+      await this.publishRuntime();
       return;
     }
-    await this.book.runtime({ protocol: 2, executor: this.executor, active: true, at: new Date().toISOString(), pid: process.pid, catalog: this.catalog, sessions }, this.executor);
+    this.online = true;
+    this.observeError = null;
+    this.sessions = sessions;
+    await this.publishRuntime();
     for (const state of orders) {
       if (TERMINAL.has(state.status)) continue;
       const order = await this.book.request(state.order_id);
+      if (!order) continue;
       if (['executing', 'uncertain'].includes(state.status)) {
         if (state.conversation_id) {
+          // The shared index stores no progress text, so compare against the
+          // saved state; otherwise every tick would rewrite an unchanged order.
+          const current = await this.book.state(state.order_id) ?? state;
           try {
-            const change = await this.desktop.progress(order, state);
-            if (change.status !== state.status || change.progress !== state.progress) {
+            const change = await this.desktop.progress(order, current);
+            if (change.status !== current.status || change.progress !== current.progress) {
               await this.book.transition(order.id, change.status, change);
             }
           } catch (error) {
-            if (state.progress !== error.message) await this.book.transition(order.id, 'uncertain', { progress: error.message });
+            if (current.progress !== error.message) await this.book.transition(order.id, 'uncertain', { progress: error.message });
           }
         }
         continue;
@@ -113,8 +221,8 @@ export class Consumer {
       }
       const sessionId = location?.conversation_id ?? input.conversation_id;
       if (order.kind === 'work_update' && input.action === 'append' && this.desktop.ready) {
-        const siblings = (await this.book.list()).filter(state => state.order_id !== order.id
-          && state.executor === this.executor && state.conversation_id === sessionId && !TERMINAL.has(state.status));
+        const siblings = this.index.pending(this.executor).filter(state => state.order_id !== order.id
+          && state.conversation_id === sessionId);
         if (siblings.length || !await this.desktop.ready(sessionId)) return;
       }
       await this.book.transition(order.id, 'dispatching');
@@ -155,15 +263,32 @@ export class Consumer {
   async close() {
     if (!this.closing) {
       this.closed = true;
+      this.schedulerStop();
       this.closing = (async () => {
         await this.tail.catch(() => {});
+        await this.runtimeWrites;
         try {
           await this.desktop.close?.();
           await this.book.runtime({ protocol: 2, executor: this.executor, active: false, at: new Date().toISOString(), catalog: this.catalog }, this.executor);
-        } finally { await this.release?.(); }
+        } finally {
+          await releaseOrderIndex(this.index);
+          this.index = null;
+          await this.release?.();
+        }
       })();
     }
     return this.closing;
+  }
+
+  schedulerStop() {
+    if (this.scheduler) {
+      clearTimeout(this.scheduler.timer);
+      this.scheduler.timer = null;
+      this.scheduler = null;
+    }
+    if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null; }
+    this.unsubscribe?.();
+    this.unsubscribe = null;
   }
 }
 
@@ -171,33 +296,75 @@ export class Consumer {
 // DSH is hosted by its own desktop plugin instead. The caller only decides
 // which adapter instance to create, so lease ownership, reconnect and shutdown
 // behave identically for every spawned-CLI executor.
-export function startConsumer({ home, executor, create, interval = 750, onError = () => {} }) {
+export function startConsumer({
+  home, executor, create, activeInterval = 750, idleInterval = 2500,
+  heartbeatInterval = 2000, onError = () => {},
+}) {
   let consumer;
   let closed = false;
-  let pending;
+  let timer = null;
+  let starting = null;
   let lastError;
-  const tick = () => {
-    if (closed || pending) return;
-    pending = (async () => {
-      if (!consumer) {
-        const candidate = new Consumer(home, create(), { executor });
-        try { await candidate.open();consumer = candidate; }
-        catch (error) { if (error.code === 'CONSUMER_BUSY') return;throw error; }
-      }
-      await consumer.tick();lastError = null;
-    })().catch(error => {
-      if (error.message !== lastError) onError(error);
-      lastError = error.message;
-    }).finally(() => { pending = null; });
+  let readySettled = false;
+  let settleReady;
+  const ready = new Promise(resolve => { settleReady = resolve; });
+  const settle = () => {
+    if (readySettled) return;
+    readySettled = true;
+    settleReady(consumer);
   };
-  const timer = setInterval(tick, interval);
-  tick();
+  const report = error => {
+    if (error.message !== lastError) onError(error);
+    lastError = error.message;
+  };
+  const retry = delay => {
+    if (closed) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; void start(); }, delay);
+  };
+  const start = () => {
+    if (closed || consumer || starting) return starting ?? undefined;
+    const attempt = (async () => {
+      let candidate;
+      let opened = false;
+      try {
+        candidate = new Consumer(home, create(), {
+          executor, onError: report, activeInterval, idleInterval, heartbeatInterval,
+        });
+        await candidate.open();
+        opened = true;
+        if (closed) { await candidate.close(); settle(); return; }
+        consumer = candidate;
+        candidate.start({ activeInterval, idleInterval, heartbeatInterval });
+        await candidate.tick();
+        lastError = null;
+        settle();
+      } catch (error) {
+        // A consumer whose first pass failed still owns the lease and index;
+        // close it before retrying so the retry is not blocked by our own lock.
+        if (consumer === candidate) consumer = null;
+        if (opened) await candidate.close().catch(() => {});
+        if (closed) return;
+        if (error.code !== 'CONSUMER_BUSY') report(error);
+        retry(idleInterval);
+        settle();
+      }
+    })();
+    // A factory can throw synchronously; clear the latch on the promise itself
+    // so the retry timer is never blocked by a settled attempt.
+    starting = attempt.finally(() => { starting = null; });
+    return starting;
+  };
+  retry(0);
   return {
-    ready: pending,
+    ready,
     async close() {
-      closed = true;clearInterval(timer);
-      await pending;
+      closed = true;
+      clearTimeout(timer);
+      timer = null;
+      await starting;
       await consumer?.close();
+      settle();
     },
   };
 }

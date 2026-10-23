@@ -1,8 +1,8 @@
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { leaseFile } from './executors.mjs';
+import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
 
-const terminal = new Set(['completed', 'failed', 'cancelled', 'blocked']);
 const json = async path => {
   try { return JSON.parse(await readFile(path, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT') return null;throw error; }
@@ -10,7 +10,8 @@ const json = async path => {
 
 // Lazily start one spawned-CLI consumer (Hermes, Qoder) from the shared
 // backend. Nothing stays resident without a saved configuration and unfinished
-// work: the check itself only reads small JSON files. `load` resolves the
+// work: the check reads the shared metadata index instead of reparsing every
+// completed request and state file on each timer tick. `load` resolves the
 // executor's worker module (injectable for tests).
 export function lazyExecutor(home, {
   executor, settingsKey, load, interval = 2000, onError = () => {},
@@ -18,7 +19,23 @@ export function lazyExecutor(home, {
   if (!executor || !settingsKey || typeof load !== 'function') throw new Error('A lazy executor needs its name, settings key and worker loader.');
   let worker;let pending;let closed = false;let errorText;
   let configuration;
+  let indexPromise;
+  let unsubscribe;
   const state = { loaded: false, external_owner_pid: null };
+  const index = () => {
+    indexPromise ??= (async () => {
+      try {
+        const value = await acquireOrderIndex(home);
+        if (!closed) unsubscribe ??= value.onChange(() => { void check(); });
+        return value;
+      } catch (error) {
+        // A transient open failure must not latch: the next timer pass retries.
+        indexPromise = null;
+        throw error;
+      }
+    })();
+    return indexPromise;
+  };
   const check = ({ force = false } = {}) => {
     if (closed) return;
     if (pending) return pending.then(() => force && !worker && !state.external_owner_pid ? check({ force }) : undefined);
@@ -35,18 +52,9 @@ export function lazyExecutor(home, {
         catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
       state.external_owner_pid = null;
-      let files;
-      try { files = await readdir(join(home, 'requests')); }
-      catch (error) { if (error.code === 'ENOENT') files = [];else throw error; }
-      let needed = force;
-      for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
-        const request = await json(join(home, 'requests', file));
-        if (request?.payload.executor !== executor) continue;
-        const saved = await json(join(home, 'states', file));
-        if (terminal.has(saved?.status)) continue;
-        needed = true;break;
-      }
-      if (!needed) return;
+      const book = await index();
+      await book.sync();
+      if (!force && !book.pending(executor).length) return;
       const module = await load();
       // Shared contract is startExecutorWorker; the legacy named exports stay
       // accepted so existing worker fixtures keep working.
@@ -62,5 +70,21 @@ export function lazyExecutor(home, {
     return pending;
   };
   const timer = setInterval(check, interval);check();
-  return { state, check, async close() { closed = true;clearInterval(timer);await pending;await worker?.close(); } };
+  return {
+    state, check,
+    async close() {
+      closed = true;
+      clearInterval(timer);
+      unsubscribe?.();
+      unsubscribe = null;
+      await pending;
+      await worker?.close();
+      if (indexPromise) {
+        const acquired = indexPromise.catch(() => null);
+        indexPromise = null;
+        const value = await acquired;
+        if (value) await releaseOrderIndex(value);
+      }
+    },
+  };
 }

@@ -103,7 +103,7 @@ export async function qoderSettings(options) {
 export async function prepareDshExtension() {
   // A self-contained copy: every relative import of these modules must resolve
   // inside this directory (executors.mjs is imported by worker/orders).
-  const names = ['extension.mjs', 'desktop.mjs', 'worker.mjs', 'orders.mjs', 'executors.mjs'];
+  const names = ['extension.mjs', 'desktop.mjs', 'worker.mjs', 'orders.mjs', 'executors.mjs', 'order-cache.mjs'];
   const sources = await Promise.all(names.map(name => readFile(new URL(name, import.meta.url))));
   const hash = createHash('sha256');
   sources.forEach((source, index) => { hash.update(names[index]);hash.update(source); });

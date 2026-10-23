@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { monitorSnapshot } from './monitor.mjs';
+import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
 
 export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
   const [html, client, sdd] = await Promise.all([
@@ -9,6 +10,9 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
     readFile(new URL('./sdd-client.js', import.meta.url)),
   ]);
   let address;
+  // The dashboard is long-lived: one metadata index per home keeps each
+  // refresh from reparsing the whole history.
+  const index = await acquireOrderIndex(home);
   const server = createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -27,7 +31,7 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
       else if (path === '/monitor-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(client);
       else if (path === '/sdd-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(sdd);
       else if (path === '/api/snapshot') {
-        const snapshot = await monitorSnapshot(home, { limit });
+        const snapshot = await monitorSnapshot(home, { limit, index });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }).end(JSON.stringify(snapshot));
       } else res.writeHead(404).end('Not found.');
     } catch (error) {
@@ -36,17 +40,26 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
     }
   });
   server.requestTimeout = 10000;server.headersTimeout = 5000;
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => { server.off('error', reject);resolve(); });
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', () => { server.off('error', reject);resolve(); });
+    });
+  } catch (error) {
+    await releaseOrderIndex(index);
+    throw error;
+  }
   address = server.address();
   return {
     url: `http://127.0.0.1:${address.port}`,
     async close() {
-      await new Promise((resolve, reject) => {
-        server.close(error => error ? reject(error) : resolve());server.closeIdleConnections();
-      });
+      try {
+        await new Promise((resolve, reject) => {
+          server.close(error => error ? reject(error) : resolve());server.closeIdleConnections();
+        });
+      } finally {
+        await releaseOrderIndex(index);
+      }
     },
   };
 }

@@ -1,8 +1,7 @@
-import { readdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
 import { OrderBook } from './orders.mjs';
 import { EXECUTORS } from './executors.mjs';
+import { acquireOrderIndex, releaseOrderIndex, orderTitle } from './order-cache.mjs';
 import { readDelegation } from './delegation.mjs';
 import { usageStatus } from './usage.mjs';
 
@@ -16,7 +15,8 @@ export const LABELS = {
 
 const epoch = value => Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
 const clean = value => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
-const actionName = { work_submit: '执行任务', work_update: '更新任务', workspace_control: '项目操作', conversation_control: '会话操作' };
+const newestFirst = (a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? ''))
+  || String(a.order_id ?? '').localeCompare(String(b.order_id ?? ''));
 
 export function elapsed(milliseconds) {
   const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -27,89 +27,95 @@ export function elapsed(milliseconds) {
 
 // This projection is read-only. Opening a monitor never creates the data folder,
 // publishes work, wakes an execution agent, or changes a task's state.
-export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {}) {
+export async function monitorSnapshot(home, { limit = 30, now = Date.now(), index } = {}) {
   const book = new OrderBook(home);
-  const warnings = [];
-  let delegation;
-  try { delegation = await readDelegation(home); }
-  catch { delegation = { enabled: false, executor: 'hermes', error: '自动派工设置读取失败，请重新保存开关。' };warnings.push(delegation.error); }
-  const executors = {};
-  for (const name of EXECUTORS) {
-    let runtime = { online: false, snapshot: null };
-    try { runtime = await book.runtime(null, name); }
-    catch (error) { warnings.push(`${name} 运行快照读取失败：${error.message}`); }
-    runtime.online = Boolean(runtime.snapshot?.active && now - (epoch(runtime.snapshot.at) ?? 0) < 6000);
-    executors[name] = runtime;
-  }
-  const online = Object.values(executors).some(runtime => runtime.online);
-  const latest = Object.values(executors).map(runtime => runtime.snapshot).filter(Boolean)
-    .sort((a, b) => (epoch(b.at) ?? 0) - (epoch(a.at) ?? 0))[0];
-  let files = [];
-  try { files = await readdir(book.requests); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const ids = files.filter(file => /^[0-9a-f-]{36}\.json$/.test(file)).map(file => file.slice(0, -5));
-  const reads = await Promise.allSettled(ids.map(async id => {
-    const [state, request] = await Promise.all([book.inspect(id), book.request(id)]);
-    const input = request.payload;
-    const start = epoch(state.created_at) ?? now;
-    const end = ACTIVE.has(state.status) ? now : epoch(state.updated_at) ?? start;
-    return {
-      ...state, title: input.title ?? (clean(input.goal).trim().slice(0, 100) || `${actionName[state.kind] ?? state.kind} · ${input.action ?? ''}`),
-      goal: input.goal ?? input.message ?? '', action: input.action ?? null,
-      model: state.route?.model ?? input.model ?? null, provider: state.route?.provider ?? input.provider ?? null,
-      directory: state.directory ?? input.directory ?? null,
-      elapsed_ms: Math.max(0, end - start),
-      stale: !executors[state.executor].online && ACTIVE.has(state.status),
-    };
-  }));
-  const orders = [];
-  reads.forEach((result, index) => {
-    if (result.status === 'fulfilled') orders.push(result.value);
-    else warnings.push(`工作单 ${ids[index].slice(0, 8)} 读取失败：${result.reason.message}`);
-  });
-  orders.sort((a, b) => b.created_at.localeCompare(a.created_at) || a.order_id.localeCompare(b.order_id));
-  const summary = { total: orders.length, active: 0, completed: 0, problems: 0, cancelled: 0 };
-  for (const order of orders) {
-    if (ACTIVE.has(order.status)) summary.active++;
-    else if (order.status === 'completed') summary.completed++;
-    else if (PROBLEMS.has(order.status)) summary.problems++;
-    else if (order.status === 'cancelled') summary.cancelled++;
-  }
-  const live = new Map(Object.entries(executors).flatMap(([name, runtime]) =>
-    (runtime.snapshot?.sessions ?? []).map(session => [`${name}:${session.id}`, session.status])));
-  const grouped = new Map();
-  for (const order of orders) {
-    if (!order.conversation_id) continue;
-    const key = `${order.executor}:${order.conversation_id}`;
-    const connected = executors[order.executor].online;
-    let agent = grouped.get(key);
-    if (!agent) {
-      agent = { id: order.conversation_id, executor: order.executor, model: null, provider: null, order_count: 0,
-        status: connected ? live.get(key) ?? 'unknown' : 'unknown',
-        stale: !connected, latest_order: order.order_id, latest_title: order.title, latest_task_status: order.status };
-      grouped.set(key, agent);
+  const owned = !index;
+  if (!index) index = await acquireOrderIndex(home);
+  try {
+    const warnings = index.warnings().slice(0, 50);
+    let delegation;
+    try { delegation = await readDelegation(home); }
+    catch { delegation = { enabled: false, executor: 'hermes', error: '自动派工设置读取失败，请重新保存开关。' };warnings.push(delegation.error); }
+    const executors = {};
+    for (const name of EXECUTORS) {
+      let runtime = { online: false, snapshot: null };
+      try { runtime = await book.runtime(null, name); }
+      catch (error) { warnings.push(`${name} 运行快照读取失败：${error.message}`); }
+      runtime.online = Boolean(runtime.snapshot?.active && now - (epoch(runtime.snapshot.at) ?? 0) < 6000);
+      executors[name] = runtime;
     }
-    agent.order_count++;
-    agent.model ??= order.model;agent.provider ??= order.provider;
+    const online = Object.values(executors).some(runtime => runtime.online);
+    const latest = Object.values(executors).map(runtime => runtime.snapshot).filter(Boolean)
+      .sort((a, b) => (epoch(b.at) ?? 0) - (epoch(a.at) ?? 0))[0];
+    // Summaries and agent grouping come from the bounded metadata index. Full
+    // request/state bodies are read only for the rows the caller displays.
+    const entries = index.all().sort(newestFirst);
+    const summary = { total: entries.length, active: 0, completed: 0, problems: 0, cancelled: 0 };
+    for (const order of entries) {
+      if (ACTIVE.has(order.status)) summary.active++;
+      else if (order.status === 'completed') summary.completed++;
+      else if (PROBLEMS.has(order.status)) summary.problems++;
+      else if (order.status === 'cancelled') summary.cancelled++;
+    }
+    const live = new Map(Object.entries(executors).flatMap(([name, runtime]) =>
+      (runtime.snapshot?.sessions ?? []).map(session => [`${name}:${session.id}`, session.status])));
+    const grouped = new Map();
+    for (const order of entries) {
+      if (!order.conversation_id) continue;
+      const key = `${order.executor}:${order.conversation_id}`;
+      const connected = executors[order.executor]?.online ?? false;
+      let agent = grouped.get(key);
+      if (!agent) {
+        agent = { id: order.conversation_id, executor: order.executor, model: null, provider: null, order_count: 0,
+          status: connected ? live.get(key) ?? 'unknown' : 'unknown',
+          stale: !connected, latest_order: order.order_id, latest_title: order.title, latest_task_status: order.status };
+        grouped.set(key, agent);
+      }
+      agent.order_count++;
+      agent.model ??= order.model;agent.provider ??= order.provider;
+    }
+    const page = entries.slice(0, limit);
+    const reads = await Promise.allSettled(page.map(async entry => {
+      const [state, request] = await Promise.all([book.inspect(entry.order_id), book.request(entry.order_id)]);
+      const input = request.payload;
+      const start = epoch(state.created_at) ?? now;
+      const end = ACTIVE.has(state.status) ? now : epoch(state.updated_at) ?? start;
+      return {
+        ...state, title: orderTitle(request),
+        goal: input.goal ?? input.message ?? '', action: input.action ?? null,
+        model: state.route?.model ?? input.model ?? null, provider: state.route?.provider ?? input.provider ?? null,
+        directory: state.directory ?? input.directory ?? null,
+        elapsed_ms: Math.max(0, end - start),
+        stale: !executors[state.executor]?.online && ACTIVE.has(state.status),
+      };
+    }));
+    const orders = [];
+    reads.forEach((result, position) => {
+      if (result.status === 'fulfilled') orders.push(result.value);
+      else if (warnings.length < 50) warnings.push(`工作单 ${page[position].order_id.slice(0, 8)} 读取失败：${result.reason.message}`);
+    });
+    orders.sort(newestFirst);
+    return {
+      generated_at: new Date(now).toISOString(), home, delegation, usage: await usageStatus(home),
+      service: { pid: process.pid, name: process.title, rss_mib: Math.round(process.memoryUsage.rss() / 1024 / 1024) },
+      worker: { online, last_seen: latest?.at ?? null,
+        heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,
+        pid: latest?.pid ?? null, live_sessions_available: Object.values(executors).some(runtime => Array.isArray(runtime.snapshot?.sessions)),
+        catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
+        executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, {
+          online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
+          models: runtime.snapshot?.catalog?.models ?? [],
+          // Older consumers omit this heartbeat field entirely. Keeping the raw
+          // value lets the board distinguish "not supported" from "supported but
+          // no preset available" instead of assuming the control exists.
+          permission_control: runtime.snapshot?.catalog?.permission_control ?? null,
+          catalog_error: runtime.snapshot?.catalog?.error ?? null,
+        }])) },
+      summary, agents: [...grouped.values()], orders, warnings,
+    };
+  } finally {
+    if (owned) await releaseOrderIndex(index);
   }
-  return {
-    generated_at: new Date(now).toISOString(), home, delegation, usage: await usageStatus(home),
-    service: { pid: process.pid, name: process.title, rss_mib: Math.round(process.memoryUsage.rss() / 1024 / 1024) },
-    worker: { online, last_seen: latest?.at ?? null,
-      heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,
-      pid: latest?.pid ?? null, live_sessions_available: Object.values(executors).some(runtime => Array.isArray(runtime.snapshot?.sessions)),
-      catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
-      executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, {
-        online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
-        models: runtime.snapshot?.catalog?.models ?? [],
-        // Older consumers omit this heartbeat field entirely. Keeping the raw
-        // value lets the board distinguish "not supported" from "supported but
-        // no preset available" instead of assuming the control exists.
-        permission_control: runtime.snapshot?.catalog?.permission_control ?? null,
-        catalog_error: runtime.snapshot?.catalog?.error ?? null,
-      }])) },
-    summary, agents: [...grouped.values()], orders: orders.slice(0, limit), warnings,
-  };
 }
 
 function charWidth(char) {
@@ -180,9 +186,11 @@ export async function monitorTerminal(home, { once = false, json = false, interv
     return;
   }
   emitKeypressEvents(input);
+  const index = await acquireOrderIndex(home);
   const wasRaw = input.isRaw;
   input.setRawMode(true);input.resume();
   output.write('\x1b[?1049h\x1b[?25l');
+  try {
   await new Promise(resolve => {
     let stopped = false;let busy = false;let selected = 0;let filter = 'all';let snapshot;
     const redraw = () => {
@@ -193,7 +201,7 @@ export async function monitorTerminal(home, { once = false, json = false, interv
     const refresh = async () => {
       if (stopped || busy) return;
       busy = true;
-      try { snapshot = await monitorSnapshot(home, { limit });redraw(); }
+      try { snapshot = await monitorSnapshot(home, { limit, index });redraw(); }
       catch (error) { if (!stopped) output.write('\x1b[H\x1b[2J读取失败：' + clean(error.message)); }
       finally { busy = false; }
     };
@@ -218,4 +226,7 @@ export async function monitorTerminal(home, { once = false, json = false, interv
     process.once('SIGINT', stop);process.once('SIGTERM', stop);
     void refresh();
   });
+  } finally {
+    await releaseOrderIndex(index);
+  }
 }

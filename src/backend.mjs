@@ -7,6 +7,7 @@ import { lazyHermes } from './hermes-loader.mjs';
 import { lazyQoder } from './qoder-loader.mjs';
 import { hookHealth } from './hook-health.mjs';
 import { createUsageReporter } from './usage.mjs';
+import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
 
 export async function startBackend(home, { usageOptions } = {}) {
   home = resolve(home);
@@ -28,6 +29,16 @@ export async function startBackend(home, { usageOptions } = {}) {
   const previous = await readJson(join(home, 'backend.json'));
   let address;let closing;
   let cache;let cacheAt = 0;let reading;let readingGeneration;let generation = 0;
+  let orderIndex;
+  const sharedIndex = () => {
+    if (!orderIndex) {
+      const attempt = acquireOrderIndex(home);
+      orderIndex = attempt;
+      // Do not latch a transient open failure: the next snapshot retries.
+      attempt.catch(() => { if (orderIndex === attempt) orderIndex = null; });
+    }
+    return orderIndex;
+  };
   const invalidate = () => { cache = null;cacheAt = 0;generation++; };
   const activation = hookHealth(home, { onChange: invalidate });
   const usage = createUsageReporter(home, usageOptions);
@@ -37,7 +48,7 @@ export async function startBackend(home, { usageOptions } = {}) {
     const startedGeneration = generation;
     const pending = (async () => {
       const { monitorSnapshot } = await import('./monitor.mjs');
-      const value = await monitorSnapshot(home);
+      const value = await monitorSnapshot(home, { index: await sharedIndex() });
       value.service.hermes_loaded = hermesWorker.state.loaded;
       value.service.qoder_loaded = qoderWorker.state.loaded;
       value.activation = activation.snapshot();
@@ -100,6 +111,11 @@ export async function startBackend(home, { usageOptions } = {}) {
     usage.close();
     await activation.close();
     await Promise.all([hermesWorker.close(), qoderWorker.close()]);
+    if (orderIndex) {
+      const acquired = await orderIndex.catch(() => null);
+      orderIndex = null;
+      if (acquired) await releaseOrderIndex(acquired);
+    }
     await new Promise(resolve => { server.close(resolve);server.closeIdleConnections(); });
     const owner = await readJson(lock);
     if (owner?.instance === instance) await unlink(lock);
@@ -112,5 +128,13 @@ export async function startBackend(home, { usageOptions } = {}) {
     const { rename } = await import('node:fs/promises');
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });await rename(temporary, join(home, 'backend.json'));
     return { ...value, close, worker: hermesWorker };
-  } catch (error) { usage.close();await activation.close();await Promise.all([hermesWorker.close(), qoderWorker.close()]);await unlink(lock);throw error; }
+  } catch (error) {
+    usage.close();await activation.close();await Promise.all([hermesWorker.close(), qoderWorker.close()]);
+    if (orderIndex) {
+      const acquired = await orderIndex.catch(() => null);
+      orderIndex = null;
+      if (acquired) await releaseOrderIndex(acquired);
+    }
+    await unlink(lock);throw error;
+  }
 }
