@@ -544,3 +544,33 @@ test('offline or partially capable DSH consumers keep unsupported presets disabl
   assert.equal(select.children[3].disabled, true);
   assert.match($('permission-help').textContent, /未提供：工作区内修改、完全权限/);
 });
+
+test('auto-update switch persists separately, starts a daily check when enabled, and restores a failed save', async () => {
+  let enabled = false;let fail = false;let status = 'idle';const actions = [];
+  const state = () => ({ status, auto_update: enabled });
+  const { $, runTimers } = await panelFixture(async (name, input) => {
+    if (name === 'panel_snapshot') return { delegation: { enabled: false, executor: 'dsh' }, worker: { executors: { dsh: { models: [] } } } };
+    assert.equal(name, 'panel_update');actions.push(JSON.parse(JSON.stringify(input)));
+    if (input.action === 'set_auto') {
+      if (fail) throw new Error('save failed');
+      enabled = input.enabled;
+    }
+    return state();
+  }, { dailyUpdate: async () => { actions.push({ action: 'check_daily' });return state(); } });
+  assert.equal($('auto-update-switch').checked, false);
+  assert.equal($('auto-update-switch').disabled, false);
+  $('auto-update-switch').checked = true;$('auto-update-switch').change();await settle();await settle();
+  assert.deepEqual(actions.slice(-2), [{ action: 'set_auto', enabled: true }, { action: 'check_daily' }]);
+  assert.equal($('auto-update-state').textContent, '已开启');
+  assert.equal($('delegation-switch').checked, false);
+  status = 'updating';$('update-refresh').click();await settle();
+  assert.equal($('auto-update-switch').disabled, false, 'a running install does not prevent turning future auto updates off');
+  $('auto-update-switch').checked = false;$('auto-update-switch').change();await settle();
+  assert.equal($('auto-update-state').textContent, '已关闭');
+  assert.ok(!actions.some(input => input.action === 'apply'), 'the server owns automatic installation');
+  status = 'idle';fail = true;
+  $('auto-update-switch').checked = true;$('auto-update-switch').change();await settle();
+  assert.equal($('auto-update-switch').checked, false);
+  assert.match($('update-message').textContent, /save failed/);
+  await runTimers();
+});

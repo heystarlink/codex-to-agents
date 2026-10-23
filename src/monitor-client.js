@@ -277,6 +277,13 @@ function renderUpdate() {
   // retry-apply entry; the backend resumes the install without re-merging.
   const pendingInstall = updateStatus?.pending_install === true;
   const retryInstall = pendingInstall && !['checking', 'updating', 'updated'].includes(status);
+  const autoSupported = typeof updateStatus?.auto_update === 'boolean';
+  $('auto-update-switch').checked = updateStatus?.auto_update === true;
+  $('auto-update-switch').disabled = !host || !autoSupported || updateBusy || stopped;
+  $('auto-update-state').textContent = updateStatus?.auto_update ? '已开启' : '已关闭';
+  $('auto-update-message').textContent = !host ? READONLY_UPDATE
+    : !autoSupported ? '正在读取自动更新设置；若开关持续不可用，请重新加载看板或重启插件后台。'
+    : updateStatus.auto_update_error || '默认关闭。开启后，看板每天首次打开时检查，有新版且安装目录干净、无运行任务时自动安装。关闭不取消已开始的安装；更新后仍需重新加载 Codex。';
   $('update-current').textContent = updateStatus?.current ?? '—';
   $('update-latest').textContent = updateStatus?.latest ?? '—';
   $('update-branch').textContent = updateStatus?.branch ?? '—';
@@ -309,13 +316,13 @@ function renderUpdate() {
   $('update-apply').disabled = !host || updateBusy || stopped || !(status === 'available' || retryInstall);
 }
 
-async function loadUpdate(action) {
+async function loadUpdate(action, enabled) {
   if (!window.agentsHost || updateBusy) return;
   updateBusy = true;
   updateError = '';
   renderUpdate();
   try {
-    updateStatus = await window.agentsHost.call('panel_update', { action });
+    updateStatus = await window.agentsHost.call('panel_update', { action, ...(action === 'set_auto' ? { enabled } : {}) });
     if (action !== 'status') updatePollExhausted = false;
     // A manual or final status read settles any poll still waiting on a timer.
     if (action === 'status' && !updateWorking()) stopUpdatePoll();
@@ -330,6 +337,7 @@ async function loadUpdate(action) {
   // Both check and apply hand long work to a detached helper and answer with
   // the active state first, so a bounded status poll follows either action.
   if (action !== 'status' && updateWorking()) scheduleUpdatePoll();
+  if (action === 'set_auto' && !updateError && updateStatus?.auto_update) void loadUpdate('check_daily');
 }
 
 function clearUpdateTimer() {
@@ -366,6 +374,7 @@ $('update').addEventListener('toggle', () => {
   // Opening the card reads cached state; it never bypasses the daily limit.
   if ($('update').open && !updateBusy) void loadUpdate('status');
 });
+$('auto-update-switch').addEventListener('change', () => void loadUpdate('set_auto', $('auto-update-switch').checked));
 $('update-refresh').addEventListener('click', () => void loadUpdate('status'));
 $('update-check').addEventListener('click', () => void loadUpdate('check'));
 $('update-apply').addEventListener('click', () => void loadUpdate('apply'));
@@ -387,7 +396,7 @@ async function refresh() {
     }
     initialized = true;
     // Once per page lifetime, only after a successful visible connection. The
-    // server shares the 24-hour claim across windows; never auto-apply.
+    // server shares the 24-hour claim and enforces the saved auto-update switch.
     if (!updateReminderChecked && !updateBusy && !stopped && !document.hidden && inView && window.agentsHost) {
       updateReminderChecked = true;
       void loadUpdate('check_daily');
@@ -424,6 +433,7 @@ function visibilityChanged() {
 function stopRefresh() {
   stopped = true;clearTimeout(refreshTimer);stopUpdatePoll();observer?.disconnect();
   $('usage-switch').disabled = true;
+  renderUpdate();
 }
 document.addEventListener('visibilitychange', visibilityChanged);
 window.addEventListener('pagehide', () => { inView = false;clearTimeout(refreshTimer);clearUpdateTimer(); });

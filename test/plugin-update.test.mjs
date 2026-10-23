@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { OrderBook } from '../src/orders.mjs';
+import { runBoardUpdate } from '../src/update-reminder.mjs';
 import { claimHelperLock, findNpmCli, finishAbandonedHelper, isOfficialOrigin, refreshDshProfile, runPluginUpdate, UPDATE_LOCK_FILE, UPDATE_STATE_FILE } from '../src/plugin-update.mjs';
 
 // Every fixture is a temporary bare repository plus a clone. Nothing here can
@@ -38,7 +39,12 @@ async function settle(home, timeout = 8000) {
   const deadline = Date.now() + timeout;
   for (;;) {
     const state = await status(home);
-    if (!['checking', 'updating'].includes(state.status)) return state;
+    if (!['checking', 'updating'].includes(state.status)) {
+      // A terminal state is written just before the helper releases its lock.
+      // Wait for that release before the fixture starts its next operation.
+      try { await access(join(home, UPDATE_LOCK_FILE)); }
+      catch (error) { if (error.code === 'ENOENT') return state;throw error; }
+    }
     if (Date.now() >= deadline) throw new Error(`update did not settle: ${JSON.stringify(state)}`);
     await delay(15);
   }
@@ -811,4 +817,38 @@ test('a late close of an old helper cannot rewrite a newer update state', async 
   assert.equal(failed.pending_install, true, 'a pending install is preserved for retry');
   assert.match(failed.message, /可能已部分更新/);
   await assert.rejects(access(join(home, UPDATE_LOCK_FILE)), { code: 'ENOENT' });
+});
+
+test('enabled auto update continues from check to install without board polling, preserving one updater lock', async t => {
+  const repo = await repository(t);let installs = 0;
+  const update = (home, input) => runPluginUpdate(home, { ...input, dependencies: repo.dependencies({
+    install: async () => { installs++;return { plugin_regenerated: true }; },
+  }) });
+  const latest = await repo.commit({ 'src/feature.txt': 'auto update\n' });
+  await runBoardUpdate(repo.home, { action: 'set_auto', enabled: true }, update);
+  assert.equal((await runBoardUpdate(repo.home, { action: 'check_daily' }, update)).status, 'checking');
+  // Status reads are passive; only the check helper can advance this flow.
+  assert.equal((await settle(repo.home)).status, 'updated');
+  assert.equal(await repo.head(), latest);assert.equal(installs, 1);
+});
+
+test('automatic installation still blocks dirty files and running work without changing HEAD', async t => {
+  for (const reason of ['dirty', 'running']) {
+    const repo = await repository(t);const before = await repo.head();let installs = 0;
+    const update = (home, input) => runPluginUpdate(home, { ...input, dependencies: repo.dependencies({
+      install: async () => { installs++;return {}; },
+    }) });
+    await repo.commit({ 'src/feature.txt': 'new\n' });
+    await check(repo.home, repo.dependencies());
+    if (reason === 'dirty') await writeFile(join(repo.install, 'src/base.txt'), 'local work\n');
+    else {
+      const book = new OrderBook(repo.home);await book.open();
+      await book.submit('work_submit', { executor: 'dsh', goal: 'running fixture' });
+    }
+    await runBoardUpdate(repo.home, { action: 'set_auto', enabled: true }, update);
+    await runBoardUpdate(repo.home, { action: 'check_daily' }, update);
+    const result = await settle(repo.home);
+    assert.equal(result.status, 'blocked');assert.equal(result.reason, reason);
+    assert.equal(await repo.head(), before);assert.equal(installs, 0);
+  }
 });

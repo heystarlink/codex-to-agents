@@ -433,24 +433,27 @@ test('panel_update is app-only, action-only, lazy, and returns the update contra
   const update = tools.find(tool => tool.name === 'panel_update');
   assert.ok(update);
   assert.deepEqual(update._meta.ui, { resourceUri: PANEL_URI, visibility: ['app'] });
-  assert.deepEqual([...update.inputSchema.properties.action.enum], ['status', 'check', 'apply', 'check_daily']);
+  assert.deepEqual([...update.inputSchema.properties.action.enum], ['status', 'check', 'apply', 'check_daily', 'set_auto']);
   for (const key of ['path', 'directory', 'url', 'command']) assert.equal(update.inputSchema.properties[key], undefined, key);
   const call = args => client.callTool({ name: 'panel_update', arguments: args });
   for (const action of ['status', 'check', 'apply']) {
     const response = await call({ action });
     assert.equal(response.isError, undefined);
-    assert.deepEqual(response.structuredContent, contract);
+    assert.deepEqual(response.structuredContent, { ...contract, auto_update: false });
   }
   assert.deepEqual(calls, ['status', 'check', 'apply'].map(action => ({ root: home, input: { action } })));
-  for (const args of [{ action: 'pull' }, { action: 'status', path: '/tmp/repo' }, { action: 'check', url: 'https://example.org' }, { action: 'apply', command: 'git pull' }]) {
+  for (const args of [{ action: 'pull' }, { action: 'set_auto' }, { action: 'status', enabled: true }, { action: 'status', path: '/tmp/repo' }, { action: 'check', url: 'https://example.org' }, { action: 'apply', command: 'git pull' }]) {
     assert.equal((await call(args)).isError, true, JSON.stringify(args));
   }
   assert.equal(calls.length, 3, 'invalid actions and client-supplied locations never reach the updater');
   const beforeDaily = calls.length;
-  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, contract);
-  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, contract);
+  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, { ...contract, auto_update: false });
+  assert.deepEqual((await call({ action: 'check_daily' })).structuredContent, { ...contract, auto_update: false });
   assert.deepEqual(calls.slice(beforeDaily).map(call => call.input.action), ['status', 'check', 'status'],
     'the app-only daily action shares a persistent throttle instead of forwarding an unknown backend action');
+  assert.equal((await call({ action: 'set_auto', enabled: true })).structuredContent.auto_update, true);
+  assert.equal((await call({ action: 'status' })).structuredContent.auto_update, true);
+  assert.equal((await call({ action: 'set_auto', enabled: false })).structuredContent.auto_update, false);
   // The update backend is imported only when an action runs, and the model
   // catalog never exposes the update tool.
   const source = await readFile(new URL('../src/panel.mjs', import.meta.url), 'utf8');

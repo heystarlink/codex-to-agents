@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OrderBook } from './orders.mjs';
+import { autoUpdateSetting } from './update-reminder.mjs';
 
 // Board-only update backend. The board never lets a client supply a repository
 // path, URL or command: the server updates its own Git checkout, resolves the
@@ -321,9 +322,19 @@ export async function runUpdateJob(home, { action, nonce, dependencies } = {}) {
       last_result: snapshot(lastResult),
     });
     const cached = snapshot(cachedState?.last_result ?? cachedState);
-    const result = action === 'check'
+    let result = action === 'check'
       ? await checkUpdate(home, deps, cached)
       : await applyUpdate(home, deps, cached);
+    // Continue in this helper under the same lock even if the board is hidden
+    // or its finite status poll ends before the network check finishes.
+    if (action === 'check' && result.status === 'available' && !result.pending_install
+        && (await autoUpdateSetting(home)).auto_update) {
+      await atomicJson(statePath(home), {
+        version: STATE_VERSION, status: 'updating', pid: process.pid,
+        started_at: nowIso(), last_result: snapshot(result),
+      });
+      result = await applyUpdate(home, deps, result);
+    }
     await atomicJson(statePath(home), result);
     return result;
   } catch (error) {

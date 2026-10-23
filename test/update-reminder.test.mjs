@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkDailyUpdate, UPDATE_REMINDER_INTERVAL as DAY } from '../src/update-reminder.mjs';
+import { autoUpdateSetting, runBoardUpdate, checkDailyUpdate, UPDATE_REMINDER_INTERVAL as DAY } from '../src/update-reminder.mjs';
 
 async function fixture(t) {
   const home = await mkdtemp(join(tmpdir(), 'agents-update-reminder-'));
@@ -73,4 +73,61 @@ test('offline/start failures consume the daily attempt without blocking explicit
   assert.equal(calls.filter(action => action === 'check').length, 1);
   await update(home, { action: 'check' });
   assert.equal(calls.filter(action => action === 'check').length, 2, 'manual check does not use the daily gate');
+});
+
+test('auto updates default OFF without creating data, persist independently, and fail closed on corrupt settings', async t => {
+  const { home, update, setState, calls } = await fixture(t);
+  assert.deepEqual(await readdir(home), []);
+  assert.deepEqual(await autoUpdateSetting(home), { auto_update: false });
+  assert.deepEqual(await readdir(home), []);
+  setState({ status: 'available', checked_at: new Date().toISOString() });
+  assert.equal((await runBoardUpdate(home, { action: 'check_daily' }, update)).status, 'available');
+  assert.ok(!calls.includes('apply'));
+  assert.equal((await runBoardUpdate(home, { action: 'set_auto', enabled: true }, update)).auto_update, true);
+  assert.ok(!calls.includes('apply'), 'saving consent alone only reads status');
+  assert.deepEqual(await autoUpdateSetting(home), { auto_update: true });
+  assert.deepEqual(await readdir(home), ['auto-update-settings.json']);
+  await access(join(home, 'auto-update-settings.json'));
+  await writeFile(join(home, 'auto-update-settings.json'), '{broken');
+  const value = await runBoardUpdate(home, { action: 'check_daily' }, update);
+  assert.equal(value.auto_update, false);assert.match(value.auto_update_error, /无法读取/);
+  assert.ok(!calls.includes('apply'));
+  assert.equal((await runBoardUpdate(home, { action: 'set_auto', enabled: false }, update)).auto_update, false);
+});
+
+test('only enabled automatic actions apply an available update; status and unfinished installs never apply', async t => {
+  const { home, update, setState, calls } = await fixture(t);
+  await runBoardUpdate(home, { action: 'set_auto', enabled: true }, update);
+  for (const state of [{ status: 'idle' }, { status: 'checking' }, { status: 'updating' },
+    { status: 'failed' }, { status: 'blocked' }, { status: 'updated' },
+    { status: 'available', pending_install: true }]) {
+    setState(state);await runBoardUpdate(home, { action: 'check_daily' }, update);
+  }
+  setState({ status: 'available', checked_at: new Date().toISOString() });
+  await runBoardUpdate(home, { action: 'status' }, update);
+  assert.ok(!calls.includes('apply'));
+  await runBoardUpdate(home, { action: 'check_daily' }, update);
+  await runBoardUpdate(home, { action: 'check_daily' }, update);
+  assert.equal(calls.filter(action => action === 'apply').length, 2);
+  await runBoardUpdate(home, { action: 'set_auto', enabled: false }, update);
+  await runBoardUpdate(home, { action: 'check_daily' }, update);
+  assert.equal(calls.filter(action => action === 'apply').length, 2);
+});
+
+test('turning OFF in another board during a status read prevents the pending auto install', async t => {
+  const { home, update, setState, calls } = await fixture(t);
+  await runBoardUpdate(home, { action: 'set_auto', enabled: true }, update);
+  setState({ status: 'available', checked_at: new Date().toISOString() });
+  let release;let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const slow = async (root, input) => {
+    if (input.action === 'status') { entered();await new Promise(resolve => { release = resolve; }); }
+    return update(root, input);
+  };
+  const pending = runBoardUpdate(home, { action: 'check_daily' }, slow);
+  await started;
+  await runBoardUpdate(home, { action: 'set_auto', enabled: false }, update);
+  release();
+  assert.equal((await pending).auto_update, false);
+  assert.ok(!calls.includes('apply'));
 });

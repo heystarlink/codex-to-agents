@@ -39,11 +39,11 @@ const sddSchema = z.object({
 }).strict();
 
 // The plugin updater is a separate module owned by the update backend. The
-// board only ever forwards an action: the server resolves the
+// board forwards an action and the user-selected auto-update boolean; the server resolves the
 // installation directory, the verified project remote and the command itself.
-const updateSchema = z.object({ action: z.enum(['status', 'check', 'apply', 'check_daily']) }).strict();
+const updateSchema = z.object({ action: z.enum(['status', 'check', 'apply', 'check_daily', 'set_auto']), enabled: z.boolean().optional() }).strict();
 const UPDATE_STATUSES = new Set(['idle', 'checking', 'up_to_date', 'available', 'blocked', 'updating', 'updated', 'failed']);
-const UPDATE_DESCRIPTION = 'Read, check or install updates for the local codex-to-agents plugin installation. status reads the cached local state without network access; check contacts the verified project remote; check_daily checks at most once per 24 hours across boards; apply installs a fast-forward update of the verified default branch while the installation is clean and idle. Accepts only action, never a path, URL or command. App-only; the model cannot see or call it.';
+const UPDATE_DESCRIPTION = 'Read, check or install updates for the local codex-to-agents plugin installation. status reads the cached local state without network access; check contacts the verified project remote; check_daily checks at most once per 24 hours across boards and may install when the user enabled auto updates; set_auto saves the user-selected enabled boolean (default off); apply installs a fast-forward update of the verified default branch while the installation is clean and idle. Accepts action and enabled only for set_auto, never a path, URL or command. App-only; the model cannot see or call it.';
 
 let builtHtml;
 export async function panelHtml() {
@@ -127,8 +127,7 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
   });
   // App-only plugin updater. The update backend is imported for the board's
   // first-visible daily check or an update-card action. Reading a snapshot or
-  // saving delegation alone never loads update/git code. The client sends only the
-  // action: the server owns the installation directory, the verified project
+  // saving delegation alone never loads update/git code. The server owns the installation directory, the verified project
   // remote and the update command. This tool is registered on the panel-only
   // MCP surface, never in the model tool catalog.
   server.registerTool('panel_update', {
@@ -137,12 +136,10 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
     inputSchema: updateSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },
-  }, async ({ action }) => {
+  }, async input => {
     try {
       const update = runUpdate ?? (async (root, input) => (await import('./plugin-update.mjs')).runPluginUpdate(root, input));
-      const value = action === 'check_daily'
-        ? await (await import('./update-reminder.mjs')).checkDailyUpdate(home, update)
-        : await update(home, { action });
+      const value = await (await import('./update-reminder.mjs')).runBoardUpdate(home, input, update);
       if (!value || typeof value !== 'object' || !UPDATE_STATUSES.has(value.status)) {
         throw new Error('更新状态无效，请稍后重试。');
       }
