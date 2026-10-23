@@ -2,9 +2,10 @@ import { readFile, unlink, writeFile, lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { OrderBook, TERMINAL } from './orders.mjs';
+import { isExecutor, leaseFile } from './executors.mjs';
 
 async function lease(home, executor) {
-  const file = join(home, executor === 'dsh' ? 'consumer.lock' : 'consumer-hermes.lock');
+  const file = join(home, leaseFile(executor));
   const identity = { pid: process.pid, nonce: randomUUID() };
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -29,7 +30,7 @@ async function lease(home, executor) {
 
 export class Consumer {
   constructor(home, desktop, { executor = 'dsh' } = {}) {
-    if (!['dsh', 'hermes'].includes(executor)) throw new Error('Unknown executor.');
+    if (!isExecutor(executor)) throw new Error('Unknown executor.');
     this.executor = executor;
     this.book = new OrderBook(home);
     this.desktop = desktop;
@@ -143,6 +144,10 @@ export class Consumer {
       const uncertain = error.deliveryUnknown || startedDelivery && !error.definite;
       await this.book.transition(order.id, uncertain ? 'uncertain' : 'failed', {
         error: error.message, progress: uncertain ? 'Submission outcome is uncertain; automatic replay is disabled.' : error.message,
+        // Adapters may already hold a richer failure record (stream text,
+        // failure kind, permission denials). Keep it rather than losing detail
+        // when delivery itself throws.
+        ...(error.output ? { output: error.output } : {}),
       });
     }
   }
@@ -160,4 +165,39 @@ export class Consumer {
     }
     return this.closing;
   }
+}
+
+// Shared consumer runner used by the lazily started adapters (Hermes, Qoder).
+// DSH is hosted by its own desktop plugin instead. The caller only decides
+// which adapter instance to create, so lease ownership, reconnect and shutdown
+// behave identically for every spawned-CLI executor.
+export function startConsumer({ home, executor, create, interval = 750, onError = () => {} }) {
+  let consumer;
+  let closed = false;
+  let pending;
+  let lastError;
+  const tick = () => {
+    if (closed || pending) return;
+    pending = (async () => {
+      if (!consumer) {
+        const candidate = new Consumer(home, create(), { executor });
+        try { await candidate.open();consumer = candidate; }
+        catch (error) { if (error.code === 'CONSUMER_BUSY') return;throw error; }
+      }
+      await consumer.tick();lastError = null;
+    })().catch(error => {
+      if (error.message !== lastError) onError(error);
+      lastError = error.message;
+    }).finally(() => { pending = null; });
+  };
+  const timer = setInterval(tick, interval);
+  tick();
+  return {
+    ready: pending,
+    async close() {
+      closed = true;clearInterval(timer);
+      await pending;
+      await consumer?.close();
+    },
+  };
 }

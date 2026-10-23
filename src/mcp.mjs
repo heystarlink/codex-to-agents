@@ -2,7 +2,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { OrderBook, definitions, inspectOrderId } from './orders.mjs';
-import { readDelegation, assertDshPermissionDispatchable } from './delegation.mjs';
+import { EXECUTORS } from './executors.mjs';
+import { readDelegation, assertPermissionDispatchable } from './delegation.mjs';
 import { registerSddTask } from './sdd-tools.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
@@ -22,7 +23,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
       annotations: { destructiveHint: definition.destructive ?? false, readOnlyHint: false, openWorldHint: true },
     }, async input => {
       try {
-        // A saved DSH permission needs a running consumer that can apply it.
+        // A saved new-session permission needs a running consumer that can apply it.
         // Enforce that only for genuinely new work: a retry reusing an existing
         // order_id must still reach OrderBook, which returns reused:true for the
         // same payload and rejects a changed one. Otherwise an idempotent
@@ -30,7 +31,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
         // heartbeat changes.
         if (kind === 'work_submit') {
           const existing = input.order_id ? await book.request(input.order_id) : null;
-          if (!existing) await assertDshPermissionDispatchable(home, input.executor ?? 'dsh');
+          if (!existing) await assertPermissionDispatchable(home, input.executor ?? 'dsh');
         }
         const order = await book.submit(kind, input);onOrder?.();return response(order);
       }
@@ -58,8 +59,8 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
     } catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
   });
   server.registerTool('runtime_info', {
-    description: 'Read consumer heartbeat and cached model catalog. Select executor dsh or hermes for its snapshot; omit to see both under executors. online=false means its work remains saved until that consumer connects.',
-    inputSchema: z.object({ executor: z.enum(['dsh', 'hermes']).optional() }).strict(), annotations: { readOnlyHint: true, openWorldHint: false },
+    description: 'Read consumer heartbeat and cached model catalog. Select executor dsh, hermes or qoder for its snapshot; omit to see every executor under executors. online=false means its work remains saved until that consumer connects.',
+    inputSchema: z.object({ executor: z.enum(EXECUTORS).optional() }).strict(), annotations: { readOnlyHint: true, openWorldHint: false },
   }, async ({ executor }) => {
     if (executor !== 'dsh') await onRuntime?.(executor);
     let delegation;

@@ -4,7 +4,25 @@ let refreshModels = true;let revision = 0;let snapshot;let modelOptionsKey;let e
 let currentSetting = { enabled: false, executor: 'hermes' };
 let usageSetting = { enabled: false };let usageSaving = false;let usageRevision = 0;let usageSupported = false;
 const $ = id => document.getElementById(id);
-const executorName = executor => executor === 'hermes' ? 'Hermes' : 'DSH';
+const EXECUTOR_NAMES = { hermes: 'Hermes', dsh: 'DSH', qoder: 'Qoder' };
+// Unknown executors keep their raw ID so a future backend addition stays visible
+// instead of being mislabelled as DSH.
+const executorName = executor => EXECUTOR_NAMES[executor] ?? executor;
+// A failed catalog read still carries the reason (CLI missing, not logged in,
+// unreadable catalog). The reason is what the user needs, so it replaces the
+// generic retry hint. Backend text is untrusted and may be long: it is
+// normalized, length-limited and only ever assigned through textContent.
+const CATALOG_ERROR_LIMIT = 200;
+function catalogErrorReason(runtime) {
+  const raw = runtime?.catalog_error;
+  const text = typeof raw === 'string' ? raw.trim().replace(/\s+/g, ' ') : '';
+  if (!text) return '';
+  return text.length > CATALOG_ERROR_LIMIT ? `${text.slice(0, CATALOG_ERROR_LIMIT)}…` : text;
+}
+const catalogErrorHelp = runtime => {
+  const reason = catalogErrorReason(runtime);
+  return reason ? `模型目录暂时不可用：${reason}` : '';
+};
 const routeKey = route => route ? JSON.stringify([route.provider, route.model]) : '';
 // Only catalog IDs are ever shown. Unfamiliar effort IDs stay readable as raw
 // values instead of being mapped or invented.
@@ -33,8 +51,9 @@ function renderModels() {
   $('delegation-model').value = selected;
   const disabled = !window.agentsHost || saving || stopped || !runtime?.online || Boolean(runtime.catalog_error) || !models.length;
   $('delegation-model').disabled = disabled;
-  $('model-help').textContent = !runtime?.online ? `${executorName(executor)} 未连接，连接后可选择模型。`
-    : runtime.catalog_error ? '模型目录暂时不可用，请稍后重试。'
+  const errorHelp = catalogErrorHelp(runtime);
+  $('model-help').textContent = errorHelp ? errorHelp
+    : !runtime?.online ? `${executorName(executor)} 未连接，连接后可选择模型。`
     : !models.length ? '此执行端暂未提供可用模型。'
     : selected && !models.some(model => routeKey(model) === selected) ? '所选模型当前不可用，请重新选择。'
     : '新任务使用所选模型，已有任务沿用原会话配置。';
@@ -60,8 +79,9 @@ function renderEfforts({ executor, runtime, models, selected, modelDisabled }) {
   }
   select.value = selected ? saved : '';
   select.disabled = modelDisabled || !selected || !efforts.length;
-  $('effort-help').textContent = !runtime?.online ? `${executorName(executor)} 未连接，连接后可设置思考强度。`
-    : runtime.catalog_error ? '模型目录暂时不可用，请稍后重试。'
+  const effortErrorHelp = catalogErrorHelp(runtime);
+  $('effort-help').textContent = effortErrorHelp ? effortErrorHelp
+    : !runtime?.online ? `${executorName(executor)} 未连接，连接后可设置思考强度。`
     : !selected ? '先选择具体模型，思考强度会绑定在该提供方和模型上。'
     : !efforts.length ? '此模型目录未提供思考强度选项，新任务跟随模型默认。'
     : saved && !efforts.includes(saved) ? '所选思考强度当前不可用，请重新选择。'
@@ -76,52 +96,75 @@ function updateConnection() {
   $('online-label').textContent = `${executorName(executor)} ${online ? '已连接' : '未连接'}`;
 }
 
-// The board stores a preset name, not a sandbox/approval pair: the DSH adapter
-// applies it through DSH's native permission service for NEW dispatch sessions
-// only. Hermes has no equivalent control, so the field is hidden for it and a
-// save made there leaves the DSH-only preference out entirely.
-const PERMISSION_HELP = '仅 DSH 新派工会话生效；已有任务沿用原权限。';
-// The running consumer advertises permission_control in its heartbeat. Old
-// consumers omit it; non-default choices must stay disabled instead of showing a
-// setting the running plugin would silently ignore.
-const PERMISSION_OPTIONS = [['', '跟随 DSH 默认'], ['read-only', '仅可查看'],
-  ['workspace-write', '工作区内修改'], ['danger-full-access', '完全权限']];
+// Each executor stores its own native new-session permission. A save sends only
+// the current executor's field; the backend merges the other executors' values.
+// The field name is never guessed from the value, so an old board that only
+// understands DSH keeps sending dsh_permission.
+const PERMISSION_FIELDS = { dsh: 'dsh_permission', hermes: 'hermes_permission', qoder: 'qoder_permission' };
+// Labels only, used to render a saved value while its executor is offline or its
+// running version no longer advertises that choice. They never claim capability:
+// the selectable list always comes from the heartbeat.
+const PERMISSION_LABELS = {
+  dsh: { 'read-only': '仅可查看', 'workspace-write': '工作区内修改', 'danger-full-access': '完全权限' },
+  hermes: { yolo: '跳过审批（会话级 YOLO）' },
+  qoder: { accept_edits: '自动接受安全编辑', dont_ask: '需确认即拒绝', auto: '由 Qoder 判断', bypass_permissions: '跳过权限审批' },
+};
+const permissionLabel = (executor, value) => PERMISSION_LABELS[executor]?.[value] ?? value;
+// Older DSH plugins advertised only { available, presets }; keep that legacy
+// native list selectable. Other executors had no control, so they get none.
+const LEGACY_DSH_OPTIONS = [['read-only', '仅可查看'], ['workspace-write', '工作区内修改'], ['danger-full-access', '完全权限']];
+function permissionOptions(executor, control, supported) {
+  if (supported && Array.isArray(control?.options) && control.options.length) {
+    return control.options.filter(entry => entry && typeof entry.value === 'string' && entry.value)
+      .map(entry => ({ value: entry.value, label: String(entry.label || entry.value), description: String(entry.description || '') }));
+  }
+  if (executor === 'dsh' && supported && Array.isArray(control?.presets)) {
+    return LEGACY_DSH_OPTIONS.filter(([value]) => control.presets.includes(value))
+      .map(([value, label]) => ({ value, label, description: '' }));
+  }
+  return [];
+}
+
 function renderPermission() {
   const executor = $('delegation-executor').value;
-  const field = $('permission-field');
   const select = $('delegation-permission');
-  const dsh = executor === 'dsh';
-  field.hidden = !dsh;
-  // With the fourth field absent the row stays balanced instead of leaving an
-  // empty track; the responsive collapse rules cover both states.
-  const grid = $('settings-fields');
-  if (grid?.classList) grid.classList.toggle('no-dsh', !dsh);
-  if (!dsh) return;
+  const fieldName = PERMISSION_FIELDS[executor];
   const runtime = snapshot?.worker?.executors?.[executor];
   const control = runtime?.permission_control;
   const online = Boolean(runtime?.online);
+  // The running consumer advertises what it can really apply. An old consumer
+  // omits the field entirely; a non-default choice must then stay unavailable
+  // instead of suggesting a setting the running end would silently ignore.
   const supported = online && !runtime?.catalog_error && control?.available === true;
-  const presets = supported && Array.isArray(control.presets) ? control.presets : [];
-  const saved = currentSetting.executor === 'dsh' && typeof currentSetting.dsh_permission === 'string' ? currentSetting.dsh_permission : '';
-  const options = PERMISSION_OPTIONS.map(([value, text]) => {
-    const available = value === '' || presets.includes(value);
-    const label = value && value === saved && !available ? `${text}（当前不可用）` : text;
-    return [value, label, !available];
-  });
-  const key = JSON.stringify([options, saved]);
+  const saved = fieldName && currentSetting.executor === executor && typeof currentSetting[fieldName] === 'string'
+    ? currentSetting[fieldName] : '';
+  const options = permissionOptions(executor, control, supported);
+  const rows = [['', supported && control?.default?.label ? control.default.label : '跟随执行端默认', false]];
+  for (const entry of options) rows.push([entry.value, entry.label, false]);
+  if (saved && !options.some(entry => entry.value === saved)) {
+    rows.push([saved, `${permissionLabel(executor, saved)}（当前不可用）`, true]);
+  }
+  const key = JSON.stringify([rows, saved]);
   if (key !== permissionOptionsKey) {
-    select.replaceChildren(...optionElements(options));
+    select.replaceChildren(...optionElements(rows));
     permissionOptionsKey = key;
   }
   select.value = saved;
-  select.disabled = !window.agentsHost || saving || stopped;
-  const missing = PERMISSION_OPTIONS.slice(1).filter(([value]) => !presets.includes(value)).map(([, text]) => text);
+  // A saved value the running version cannot offer may still be cleared back to
+  // the executor default, so the picker stays usable for that repair path.
+  select.disabled = !window.agentsHost || saving || stopped || (!supported && !saved);
+  const selected = options.find(entry => entry.value === saved);
+  const description = saved ? selected?.description ?? '' : supported ? String(control?.default?.description || '') : '';
+  // Keep the compact field help to one effect line plus the scope; protocol
+  // details live in the README instead of the board.
+  const effect = `${description || '按所选权限启动新会话。'} 仅新会话生效；已有任务沿用原权限。`;
+  const savedHint = saved ? ' 已保存的固定值会阻止派工，请连接后修改或恢复默认。' : '';
   $('permission-help').textContent = !window.agentsHost ? '请在 Codex 的 Agents 看板中设置新会话权限。'
-    : !online ? 'DSH 未连接，无法确认新会话权限控制；暂时只能跟随默认。'
-    : runtime.catalog_error ? 'DSH 运行状态暂时不可用，无法确认权限控制；暂时只能跟随默认。'
-    : !supported ? '当前 DSH 运行插件未加载新会话权限控制（可能仍是旧版本），暂时只能跟随默认。请重新加载 codex-to-agents 插件并重启 DSH。'
-    : missing.length ? `DSH 当前未提供：${missing.join('、')}；其余权限可用。`
-    : PERMISSION_HELP;
+    : !online ? `${executorName(executor)} 未连接，无法确认新会话权限控制；暂时只能跟随默认。${savedHint}`
+    : runtime.catalog_error ? `${catalogErrorHelp(runtime) || '运行状态暂时不可用'}；无法确认新会话权限控制，暂时只能跟随默认。${savedHint}`
+    : !supported ? `当前 ${executorName(executor)} 运行端未提供新会话权限控制（可能仍是旧版本）；暂时只能跟随默认。${saved ? ' 已保存的固定值会阻止派工，请恢复默认或升级该执行端。' : ''}`
+    : saved && !selected ? '所选权限当前不可用，请重新选择。'
+    : effect;
 }
 
 function renderActivation() {
@@ -203,13 +246,14 @@ async function saveSetting({ executorChanged = false } = {}) {
     const effort = $('delegation-effort').value;
     if (effort) input.effort = effort;
   }
-  if (!executorChanged && executor === 'dsh') {
+  const permissionFieldName = PERMISSION_FIELDS[executor];
+  if (!executorChanged && permissionFieldName) {
     const permission = $('delegation-permission').value;
-    // Send only when there is a choice to change or preserve: an untouched
-    // "follow DSH default" save adds no field, while clearing a saved choice
-    // sends "default" so the backend removes it. Switching executor omits the
-    // field, so the DSH-only preference is not carried across executors.
-    if (permission || currentSetting.dsh_permission) input.dsh_permission = permission || 'default';
+    const savedPermission = typeof currentSetting[permissionFieldName] === 'string' ? currentSetting[permissionFieldName] : '';
+    // Send only an actual change: an untouched save leaves this executor's
+    // choice alone, and the backend keeps the other executors' fields. Clearing
+    // sends "default" so the backend removes this executor's value only.
+    if (permission !== savedPermission) input[permissionFieldName] = permission || 'default';
   }
   $('delegation-switch').disabled = $('delegation-executor').disabled = $('delegation-model').disabled = true;
   $('delegation-effort').disabled = $('delegation-permission').disabled = true;

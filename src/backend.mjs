@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { backendAuth, readJson } from './backend-control.mjs';
 import { lazyHermes } from './hermes-loader.mjs';
+import { lazyQoder } from './qoder-loader.mjs';
 import { hookHealth } from './hook-health.mjs';
 import { createUsageReporter } from './usage.mjs';
 
@@ -22,7 +23,8 @@ export async function startBackend(home, { usageOptions } = {}) {
       if (attempt) throw new Error('Could not acquire shared backend lock.');
     }
   }
-  const worker = lazyHermes(home, { onError: error => console.error(error.message) });
+  const hermesWorker = lazyHermes(home, { onError: error => console.error(error.message) });
+  const qoderWorker = lazyQoder(home, { onError: error => console.error(error.message) });
   const previous = await readJson(join(home, 'backend.json'));
   let address;let closing;
   let cache;let cacheAt = 0;let reading;let readingGeneration;let generation = 0;
@@ -35,7 +37,9 @@ export async function startBackend(home, { usageOptions } = {}) {
     const startedGeneration = generation;
     const pending = (async () => {
       const { monitorSnapshot } = await import('./monitor.mjs');
-      const value = await monitorSnapshot(home);value.service.hermes_loaded = worker.state.loaded;
+      const value = await monitorSnapshot(home);
+      value.service.hermes_loaded = hermesWorker.state.loaded;
+      value.service.qoder_loaded = qoderWorker.state.loaded;
       value.activation = activation.snapshot();
       if (startedGeneration === generation) {
         cache = value;cacheAt = Date.now();
@@ -57,7 +61,12 @@ export async function startBackend(home, { usageOptions } = {}) {
     const path = new URL(req.url, `http://${host}`).pathname;
     try {
       if (path === '/health' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ pid: process.pid, home, instance, hermes_loaded: worker.state.loaded, external_owner_pid: worker.state.external_owner_pid }));return;
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({
+          pid: process.pid, home, instance,
+          hermes_loaded: hermesWorker.state.loaded, qoder_loaded: qoderWorker.state.loaded,
+          external_owner_pid: hermesWorker.state.external_owner_pid,
+          qoder_external_owner_pid: qoderWorker.state.external_owner_pid,
+        }));return;
       }
       if (path === '/control/stop' && req.method === 'POST') {
         res.writeHead(200).end('{}');setImmediate(() => void close());return;
@@ -72,11 +81,11 @@ export async function startBackend(home, { usageOptions } = {}) {
         onPanel: () => { void usage.activity();return activation.check(); },
         onUsage: enabled => { usage.settingsChanged(enabled);invalidate(); },
         onRuntime: async executor => {
-          if (executor !== 'dsh') {
-            await worker.check({ force: true });invalidate();
-          }
+          if (executor === 'hermes') await hermesWorker.check({ force: true });
+          else if (executor === 'qoder') await qoderWorker.check({ force: true });
+          if (executor !== 'dsh') invalidate();
         },
-        onOrder: () => { invalidate();worker.check(); } });
+        onOrder: () => { invalidate();void hermesWorker.check();void qoderWorker.check(); } });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on('close', () => { void transport.close();void mcp.close(); });
       await mcp.connect(transport);await transport.handleRequest(req, res);
@@ -90,7 +99,7 @@ export async function startBackend(home, { usageOptions } = {}) {
   const close = () => closing ??= (async () => {
     usage.close();
     await activation.close();
-    await worker.close();
+    await Promise.all([hermesWorker.close(), qoderWorker.close()]);
     await new Promise(resolve => { server.close(resolve);server.closeIdleConnections(); });
     const owner = await readJson(lock);
     if (owner?.instance === instance) await unlink(lock);
@@ -102,6 +111,6 @@ export async function startBackend(home, { usageOptions } = {}) {
     const temporary = join(home, `backend.${instance}.tmp`);
     const { rename } = await import('node:fs/promises');
     await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });await rename(temporary, join(home, 'backend.json'));
-    return { ...value, close, worker };
-  } catch (error) { usage.close();await activation.close();await worker.close();await unlink(lock);throw error; }
+    return { ...value, close, worker: hermesWorker };
+  } catch (error) { usage.close();await activation.close();await Promise.all([hermesWorker.close(), qoderWorker.close()]);await unlink(lock);throw error; }
 }

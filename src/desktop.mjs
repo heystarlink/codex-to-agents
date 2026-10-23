@@ -11,6 +11,20 @@ const DSH_PERMISSION_LABELS = Object.freeze({
   'read-only': '仅可查看', 'workspace-write': '工作区内修改', 'danger-full-access': '完全权限',
 });
 export const dshPermissionName = name => DSH_PERMISSION_LABELS[name] ?? name;
+// The board renders exactly these native presets. Each one is a sandbox plus
+// approval pair defined by the DSH base profile; the adapter never invents a
+// combination, so the descriptions stay at the preset level.
+const DSH_PERMISSION_DESCRIPTIONS = Object.freeze({
+  'read-only': '只能查看，不能修改文件。',
+  'workspace-write': '可在工作区内修改。',
+  'danger-full-access': '不受工作区限制，风险最高。',
+});
+const DSH_PERMISSION_DEFAULT = Object.freeze({
+  value: '', label: '跟随 DSH 默认', description: '不修改 DSH 原生权限设置。',
+});
+const DSH_PERMISSION_LIMITATIONS = Object.freeze([
+  '仅新会话生效；已有任务沿用原权限。',
+]);
 
 function claimedMessage(events, orderId) {
   const inboxes = new Map();let claimed;
@@ -79,16 +93,27 @@ export class Desktop {
     let service;
     try { service = typeof this.context?.get === 'function' ? this.context.get('permissionPresets') : undefined; }
     catch { service = undefined; }
+    const capability = {
+      available: false, presets: [], scope: 'new_session',
+      default: { ...DSH_PERMISSION_DEFAULT }, options: [], limitations: [...DSH_PERMISSION_LIMITATIONS],
+    };
     // A service object alone is not enough: the adapter needs all three native
     // operations, so a partial/older implementation must not be advertised.
     if (!service || typeof service.catalog !== 'function' || typeof service.set !== 'function' || typeof service.current !== 'function') {
-      return { available: false, presets: [] };
+      return capability;
     }
     try {
-      const options = service.catalog()?.options;
-      const presets = DSH_PERMISSION_PRESETS.filter(name => (options ?? []).some(option => option?.value === name));
-      return { available: presets.length > 0, presets };
-    } catch { return { available: false, presets: [] }; }
+      const entries = service.catalog()?.options;
+      const offered = DSH_PERMISSION_PRESETS.filter(name => (entries ?? []).some(option => option?.value === name));
+      return {
+        ...capability,
+        available: offered.length > 0,
+        presets: offered,
+        options: offered.map(value => ({
+          value, label: DSH_PERMISSION_LABELS[value], description: DSH_PERMISSION_DESCRIPTIONS[value],
+        })),
+      };
+    } catch { return capability; }
   }
 
   observe(conversationIds) {

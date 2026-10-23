@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { monitorSnapshot } from './monitor.mjs';
+import { EXECUTORS } from './executors.mjs';
 import { delegationInputSchema, saveDelegation, readDelegation } from './delegation.mjs';
 import { saveUsageSetting } from './usage.mjs';
 
@@ -72,7 +73,7 @@ export function registerPanel(server, home, { snapshot = () => monitorSnapshot(h
   }, async () => ({ content: [{ type: 'text', text: 'Agents 看板已打开。自动派工由看板中的开关控制。' }] }));
   for (const [name, description, schema, action] of [
     ['panel_snapshot', 'Read delegation preferences and available executor models. refresh_models loads the selected executor runtime without submitting work.',
-      z.object({ executor: z.enum(['hermes', 'dsh']).optional(), refresh_models: z.boolean().optional() }).strict(), async ({ executor, refresh_models }) => {
+      z.object({ executor: z.enum(EXECUTORS).optional(), refresh_models: z.boolean().optional() }).strict(), async ({ executor, refresh_models }) => {
         Promise.resolve(onPanel?.()).catch(error => console.error(error.message));
         if (refresh_models) {
           // Keep the switch usable while a disconnected executor is starting.

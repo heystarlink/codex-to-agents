@@ -343,9 +343,20 @@ test('running work orders and live native sessions block apply', async t => {
   const sessionBlocked = await settle(repo.home);
   assert.equal(sessionBlocked.status, 'blocked');
   assert.equal(sessionBlocked.reason, 'running');
+  // The idle check also covers Qoder: an update must not replace code under a
+  // running native Qoder session.
+  await book.runtime({ protocol: 2, executor: 'dsh', active: false, at: new Date().toISOString() }, 'dsh');
+  await book.runtime({ protocol: 2, executor: 'qoder', active: true, at: new Date().toISOString(), pid: process.pid,
+    sessions: [{ id: 'qoder-running', status: 'running' }] }, 'qoder');
+  await start(repo.home, 'apply', deps());
+  const qoderBlocked = await settle(repo.home);
+  assert.equal(qoderBlocked.status, 'blocked');
+  assert.equal(qoderBlocked.reason, 'running');
+  assert.equal(qoderBlocked.running_sessions, 1);
   assert.deepEqual(installs, []);
 
   await book.runtime({ protocol: 2, executor: 'dsh', active: false, at: new Date().toISOString(), sessions: [] }, 'dsh');
+  await book.runtime({ protocol: 2, executor: 'qoder', active: false, at: new Date().toISOString(), sessions: [] }, 'qoder');
   await start(repo.home, 'apply', deps());
   const updated = await settle(repo.home);
   assert.equal(updated.status, 'updated');

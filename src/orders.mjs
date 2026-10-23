@@ -2,9 +2,10 @@ import { z } from 'zod';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, writeFile, rename, link, unlink, chmod } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
+import { EXECUTORS, isExecutor, runtimeFile, executorLabel } from './executors.mjs';
 
 const nonempty = z.string().trim().min(1);
-const executor = z.enum(['dsh', 'hermes']).optional();
+const executor = z.enum(EXECUTORS).optional();
 
 // Shared by every MCP registration that accepts a work-order UUID. MCP clients
 // validate arguments before our handlers run, so the parameter description and
@@ -22,12 +23,12 @@ export const inspectOrderId = optionalUuid(INSPECT_ORDER_ID_DESCRIPTION, INSPECT
 
 export const definitions = {
   work_submit: {
-    text: 'Save a work order for an execution agent. executor selects dsh (default) or hermes. Returns an order ID immediately, even offline. Omit order_id and the server generates a UUID; if you supply it, generate a real UUID (for example with crypto.randomUUID()) before the first call and reuse that same order_id with identical arguments for an uncertain retry. Never use a task title, cw- conversation ID, or example placeholder.',
+    text: 'Save a work order for an execution agent. executor selects dsh (default), hermes or qoder. Returns an order ID immediately, even offline. Omit order_id and the server generates a UUID; if you supply it, generate a real UUID (for example with crypto.randomUUID()) before the first call and reuse that same order_id with identical arguments for an uncertain retry. Never use a task title, cw- conversation ID, or example placeholder.',
     schema: z.object({ order_id: orderId, executor, goal: nonempty.max(50000), directory: nonempty.optional(), workspace_id: nonempty.optional(), title: nonempty.max(100).optional(), provider: nonempty.optional(), model: nonempty.optional(), effort: nonempty.optional() }).strict()
       .refine(v => !(v.directory && v.workspace_id), 'Choose directory or workspace_id.'),
   },
   work_update: {
-    text: 'Save a follow-up or cancellation. target_order inherits its executor; when addressing conversation_id select executor explicitly for Hermes. Hermes interrupt delivers a steer acknowledgement; cancel requests interruption.',
+    text: 'Save a follow-up or cancellation. target_order inherits its executor; when addressing conversation_id select executor explicitly. Hermes interrupt delivers a steer acknowledgement; cancel requests interruption. Qoder supports append/cancel but not interrupt.',
     schema: z.object({ order_id: orderId, executor, target_order: targetOrder, conversation_id: nonempty.optional(), action: z.enum(['append', 'interrupt', 'cancel']), message: nonempty.max(50000).optional() }).strict()
       .refine(v => Boolean(v.target_order) !== Boolean(v.conversation_id), 'Choose exactly one target.')
       .refine(v => v.action === 'cancel' || v.message, 'A message is required for append/interrupt.'),
@@ -42,7 +43,7 @@ export const definitions = {
     destructive: true,
   },
   conversation_control: {
-    text: 'Queue list, rename, archive or restore of agent conversations. executor selects dsh (default) or hermes. Archive of running work needs stop_running=true.',
+    text: 'Queue list, rename, archive or restore of agent conversations. executor selects dsh (default), hermes or qoder. Qoder has no verified session-management commands, so these actions are rejected explicitly instead of deleting sessions. Archive of running work needs stop_running=true.',
     schema: z.object({ order_id: orderId, executor, action: z.enum(['list', 'rename', 'archive', 'restore']), conversation_id: nonempty.optional(), workspace_id: nonempty.optional(), title: nonempty.max(100).optional(), include_archived: z.boolean().default(false), stop_running: z.boolean().default(false), offset: z.number().int().min(0).default(0), limit: z.number().int().min(1).max(100).default(30) }).strict()
       .refine(v => v.action === 'list' || v.conversation_id, 'conversation_id is required.')
       .refine(v => v.action !== 'rename' || v.title, 'rename needs title.'),
@@ -95,12 +96,15 @@ export class OrderBook {
       if (!target) throw new Error('Target work order not found.');
       const inherited = target.payload.executor ?? 'dsh';
       if (payload.executor && payload.executor !== inherited) throw new Error('executor must match the target work order.');
-      if (inherited === 'hermes') payload.executor = inherited;
+      // Persist the inherited executor for every consumer that is not the DSH
+      // default, so the owning consumer can filter its own updates.
+      if (inherited !== 'dsh') payload.executor = inherited;
     }
-    if (payload.executor === 'hermes' && (kind === 'workspace_control' || payload.workspace_id)) {
-      throw new Error('Hermes uses session directories; desktop workspace operations are not supported. Use directory instead.');
+    if (payload.executor && payload.executor !== 'dsh' && (kind === 'workspace_control' || payload.workspace_id)) {
+      const label = executorLabel(payload.executor);
+      throw new Error(`${label} uses a session directory; desktop workspace operations are not supported. Use directory instead.`);
     }
-    if (payload.executor === 'hermes') {
+    if (payload.executor && payload.executor !== 'dsh') {
       const { snapshot } = await this.runtime();
       if (snapshot?.active && snapshot.protocol !== 2) {
         let alive = true;
@@ -108,7 +112,7 @@ export class OrderBook {
           try { process.kill(snapshot.pid, 0); }
           catch (error) { if (error.code === 'ESRCH') alive = false;else throw error; }
         }
-        if (alive) throw new Error('Reload the DSH consumer before submitting Hermes work: the running legacy consumer does not filter executors. Run the DSH enable command again.');
+        if (alive) throw new Error(`Reload the DSH consumer before submitting ${executorLabel(payload.executor)} work: the running legacy consumer does not filter executors. Run the DSH enable command again.`);
       }
     }
     const id = order_id ?? randomUUID();
@@ -153,8 +157,8 @@ export class OrderBook {
   }
 
   async runtime(value, executor = 'dsh') {
-    if (!['dsh', 'hermes'].includes(executor)) throw new Error('Unknown executor.');
-    const path = join(this.home, executor === 'dsh' ? 'runtime.json' : 'runtime-hermes.json');
+    if (!isExecutor(executor)) throw new Error('Unknown executor.');
+    const path = join(this.home, runtimeFile(executor));
     if (value) await this.atomic(path, value);
     const stored = value ?? await readJson(path);
     return {
@@ -164,7 +168,11 @@ export class OrderBook {
   }
 
   async runtimes() {
-    const [dsh, hermes] = await Promise.all([this.runtime(), this.runtime(null, 'hermes')]);
-    return { online: dsh.online || hermes.online, snapshot: dsh.online || !hermes.online ? dsh.snapshot : hermes.snapshot, executors: { dsh, hermes } };
+    const entries = await Promise.all(EXECUTORS.map(async name => [name, await this.runtime(null, name)]));
+    const executors = Object.fromEntries(entries);
+    const online = entries.find(([, runtime]) => runtime.online);
+    // Prefer a live executor; otherwise keep the historical DSH-first snapshot
+    // so existing callers that expect a DSH heartbeat keep working.
+    return { online: Boolean(online), snapshot: (online ?? executors.dsh).snapshot, executors };
   }
 }

@@ -37,13 +37,13 @@ Hermes 的本地 Dashboard 临时 token 仅在内存中使用，不保存到工�
 
 ## 自动派工设置
 
-看板将开关、执行端、可选模型、思考强度和 DSH 新会话权限保存到所选数据目录的 `delegation.json`，默认关闭，默认执行端为 Hermes。固定模型保存为 `route: { provider, model }`，省略 `route` 表示跟随执行端默认；显式思考强度另存为顶层 `effort`，只与固定 `route` 一起保存。省略 `effort` 表示跟随模型默认，不显式传递强度。DSH 权限保存为顶层 `dsh_permission`，只接受 DSH 原生预设名 `read-only`、`workspace-write`、`danger-full-access`；省略该字段表示跟随 DSH 新会话默认，保存 `"default"` 等价于清除该字段。设置对使用该插件和数据目录的本机 Codex 会话共享生效。
+看板将开关、执行端、可选模型、思考强度和当前执行端的新会话权限保存到所选数据目录的 `delegation.json`，默认关闭，默认执行端为 Hermes。固定模型保存为 `route: { provider, model }`，省略 `route` 表示跟随执行端默认；显式思考强度另存为顶层 `effort`，只与固定 `route` 一起保存。省略 `effort` 表示跟随模型默认，不显式传递强度。三端权限分别保存为顶层 `dsh_permission`、`hermes_permission`、`qoder_permission`：`dsh_permission` 只接受 `read-only`、`workspace-write`、`danger-full-access`；`hermes_permission` 只接受 `yolo`；`qoder_permission` 只接受 `accept_edits`、`dont_ask`、`auto`、`bypass_permissions`。省略某字段表示跟随该端原生默认；保存 `"default"` 只清除该端字段；保存任一端时其他端字段原样保留。设置对使用该插件和数据目录的本机 Codex 会话共享生效。
 
 模型列表来自所选执行端的模型目录。打开看板或切换执行端时，后台异步加载该端运行时；界面继续显示连接状态，DSH 的模型查询不加载 Hermes。选择固定模型时校验提供方和模型组合，离线或模型已移除时拒绝新选择；已有固定模型离线时仍可关闭派工。思考强度只使用目录为该模型返回的 `efforts`：没有 `efforts` 的目录项不虚构选项，界面禁用强度选择并说明跟随模型默认；模型没有可用强度选项时不接受显式强度。切换模型或执行端会清除不兼容的强度，已有任务沿用原会话配置。切换执行端恢复为跟随默认，已有会话保留原模型和强度。
 
-`dsh_permission` 只由看板设置，`work_submit` 等模型可调用接口不接受该字段。DSH adapter 在创建每个新派工会话前读取该偏好，通过 DSH 原生 `permissionPresets` 服务应用对应预设，并在提交第一条任务消息前读回确认；已有会话和 `work_update` 追问不会重新应用。保存值不是已配置预设、DSH 未提供该原生服务，或应用后读回不一致时，本次派工会明确失败且不会以其他权限提交任务。Hermes 不显示也不读取该设置。
+三个权限字段都只由看板设置，`work_submit`、`work_update` 等模型可调用接口不接受。各 adapter 只在新建派工会话时应用，续聊与追问沿用原任务记录的权限，不重新读取看板：DSH 在会话创建后、首条任务消息前通过原生 `permissionPresets` 应用对应预设并读回确认；Hermes 在 `session.create` 后、`prompt.submit` 前调用原生 `config.set {key:"yolo", session_id, value:"1"}`（默认 session 范围，绝不传 `scope=global`），要求返回 `scope:"session"` 与 `value:"1"`，并尽力用 `session.activate` 的 `info.yolo` 读回；等不到事件读回时记录 `readback:"setter-only"`，不把它当作 effective 证据。Qoder 在 spawn 时传 `--permission-mode <snake_case>`；真实 1.1.78 在写入 stdin 前不产生任何 init，因此以收到 `system/init.permissionMode` 后按 alias（`acceptEdits` 等）归一化核对为准：写 stdin 前不一致是 definite 失败，写入后不一致则终止并标记 uncertain，后续同一 stdout chunk 里的成功 result 不得覆盖该结论。保存值不受支持、原生服务缺失或应用/核对失败时，本次派工在提交任务前明确失败。
 
-看板能力来自 DSH consumer 心跳里的 `permission_control`（新插件由 `Desktop.describe()` 发布可用预设）。旧 consumer 的心跳没有该字段，看板会把非默认选项置灰并提示重新加载插件、重启 DSH；保存新的显式权限时后台也校验当前心跳，旧插件或离线时拒绝保存。若磁盘上已保存显式权限而当前运行的 consumer 不支持，`work_submit` 会在保存工作单前明确失败，避免旧端按默认权限静默启动；`work_update` 续会话不受此限制。
+看板能力来自各执行端 consumer 心跳里的 `catalog.permission_control`：`{available, presets, options:[{value,label,description}], default, limitations, scope:"new_session"}`。旧 consumer 的心跳没有该字段时，看板只允许跟随默认并提示更新或重新加载；DSH 旧心跳只有 `presets` 时仍按旧原生列表渲染。保存新的显式权限前，后台校验当前心跳是否声明该值，旧 consumer 或离线时拒绝保存；若磁盘上已保存显式权限而当前运行端不支持，`work_submit` 会在保存工作单前明确失败。`work_update` 续会话不重读该设置。
 
 插件的 `UserPromptSubmit` Hook 经用户信任后，在每条用户消息到来时读取当前设置，并给 Codex 添加本轮派工偏好。设置读取失败按关闭处理。Hook 不投递任务、不记录用户提示、不修改全局 `AGENTS.md` 或工具权限；具体是否委派由 Codex 按需求和有效指令判断。
 
@@ -257,9 +257,9 @@ node src/command.mjs disable
 npm test
 ```
 
-覆盖工作单发布、幂等提交、消费者排他、恢复、模型限制、结果关联、HTTP 共享后台、stdio 转发、看板隐藏/恢复、模型偏好保存、Hook 就绪检查，以及 SDD 开关独立持久化、旧配置兼容、关闭时拒绝写入、重新开启、草稿保护与失败回滚、多看板过期写入和 Hook 的四种开关组合。2026-10-23 本机完整回归 161 项自动测试全部通过，包括思考强度选择、DSH 新会话权限、更新检查、快进安装与中断恢复。这不等于所有模型和客户端组合都完成业务验收。
+覆盖工作单发布、幂等提交、消费者排他、恢复、模型限制、结果关联、HTTP 共享后台、stdio 转发、看板隐藏/恢复、模型偏好保存、Hook 就绪检查，以及 SDD 开关独立持久化、旧配置兼容、关闭时拒绝写入、重新开启、草稿保护与失败回滚、多看板过期写入和 Hook 的四种开关组合。2026-10-24 本机完整回归共 259 项自动测试均已通过验证：主会话单次完整运行 258/259，唯一失败的过期看板静态文案断言（权限默认项已改为按执行端动态渲染）修复后定向复跑 1/1 通过（未宣称单次完整运行 259/259；日志 `.local/permissions-main-full-tests.tap`、`.local/permissions-main-panel-recheck.tap`）；相关 145 项定向测试通过（`.local/permissions-related-tests.tap`）。定向测试覆盖思考强度选择、三端新会话权限、更新检查、快进安装与中断恢复。这不等于所有模型和客户端组合都完成业务验收。
 
-DSH 新会话权限的定向测试另外覆盖三种原生预设映射、跟随默认不写权限事件、未知/损坏配置拒绝派工、原生服务缺失或应用失败时阻止提交、首次任务消息前完成设置并读回确认、续会话不重设，以及看板保存、失败回退、Hermes 不发送该字段和窄屏布局规则；同时覆盖心跳能力透传、旧 consumer 下非默认选项禁用与保存拒绝、`work_submit` 对旧 consumer/离线环境的明确阻止，以及快照依赖闭包。该组定向测试不替代完整回归或 DSH 实机权限验收。
+新会话权限的定向测试覆盖：三端字段独立保存/合并与 `default` 单端清除、未知或损坏配置拒绝、看板按心跳能力渲染并按当前执行端保存、切换执行端不串用；DSH 三种原生预设映射、跟随默认不写权限事件、首条任务消息前应用并读回、原生服务缺失或应用失败阻止提交；Hermes 会话级 `config.set` 的 scope/value 强校验、`session.info` 读回与 setter-only 标注、setter 拒绝时阻止提交、续聊不重设；Qoder `--help` 真实能力探测、snake_case 传参、init camelCase alias 归一化核对、写后不一致保持 uncertain 不被成功 result 覆盖、续聊重传原记录值、旧 CLI 无该选项时阻止派工；以及 `work_submit` 对旧 consumer/离线环境的明确阻止和快照依赖闭包。该组定向测试不替代 Hermes/Qoder 的完整业务实机验收。
 
 DSH 实机脚本：
 

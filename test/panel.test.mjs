@@ -247,7 +247,7 @@ test('Dsh permission preference is optional, strictly validated and cleared with
   // board persist a value the old end would silently ignore.
   const pinned = await readFile(file, 'utf8');
   await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
-  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' }), /未加载新会话权限控制/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' }), /未提供新会话权限/);
   assert.equal(await readFile(file, 'utf8'), pinned);
   await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
   await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' }), /DSH 未连接/);
@@ -264,7 +264,7 @@ test('Dsh permission preference is optional, strictly validated and cleared with
   await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'everything' }));
   await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: { sandbox: 'danger-full-access', approval: 'never' } }));
   assert.equal(await readFile(file, 'utf8'), before);
-  // Hermes may coexist with a stored DSH-only preference, but the model-facing
+  // Hermes may coexist with a stored DSH preference, but the model-facing
   // dispatch prompt never claims it as a permission setting.
   await advertise();
   await saveDelegation(home, { enabled: true, executor: 'hermes', dsh_permission: 'read-only' });
@@ -273,6 +273,77 @@ test('Dsh permission preference is optional, strictly validated and cleared with
   const context = await delegationContext(home);
   assert.match(context, /executor: "hermes"/);
   assert.doesNotMatch(context, /dsh_permission|read-only/);
+});
+
+test('saving one executor keeps the other executors permissions, and default clears only that executor', async t => {
+  const home = await fixture(t);
+  const book = new OrderBook(home);await book.open();
+  const advertise = (executor, presets) => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(),
+    catalog: { models: [], permission_control: { available: true, presets } } }, executor);
+  await advertise('dsh', ['read-only', 'workspace-write', 'danger-full-access']);
+  await advertise('hermes', ['yolo']);
+  await advertise('qoder', ['accept_edits', 'dont_ask', 'auto', 'bypass_permissions']);
+
+  await saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'read-only' });
+  await saveDelegation(home, { enabled: true, executor: 'hermes', hermes_permission: 'yolo' });
+  await saveDelegation(home, { enabled: true, executor: 'qoder', qoder_permission: 'accept_edits' });
+  let stored = await readDelegation(home);
+  assert.equal(stored.dsh_permission, 'read-only');
+  assert.equal(stored.hermes_permission, 'yolo');
+  assert.equal(stored.qoder_permission, 'accept_edits');
+  // The same executor's later choice replaces only that field.
+  await saveDelegation(home, { enabled: true, executor: 'qoder', qoder_permission: 'dont_ask' });
+  stored = await readDelegation(home);
+  assert.equal(stored.dsh_permission, 'read-only');
+  assert.equal(stored.hermes_permission, 'yolo');
+  assert.equal(stored.qoder_permission, 'dont_ask');
+  // Explicit default clears exactly one executor's fixed value, even offline.
+  await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } }, 'hermes');
+  await saveDelegation(home, { enabled: true, executor: 'hermes', hermes_permission: 'default' });
+  stored = await readDelegation(home);
+  assert.equal(stored.hermes_permission, undefined);
+  assert.equal(stored.dsh_permission, 'read-only');
+  assert.equal(stored.qoder_permission, 'dont_ask');
+  const raw = JSON.parse(await readFile(join(home, 'delegation.json'), 'utf8'));
+  assert.equal('hermes_permission' in raw, false);
+
+  // Unknown native values for any executor are rejected without touching the file.
+  const before = await readFile(join(home, 'delegation.json'), 'utf8');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'hermes', hermes_permission: 'auto' }));
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'qoder', qoder_permission: 'plan' }));
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'dsh', dsh_permission: 'acceptAll' }));
+  assert.equal(await readFile(join(home, 'delegation.json'), 'utf8'), before);
+  // A changed value without the running executor's capability cannot be saved.
+  await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } }, 'qoder');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'qoder', qoder_permission: 'bypass_permissions' }), /未提供新会话权限/);
+  stored = await readDelegation(home);
+  assert.equal(stored.qoder_permission, 'dont_ask');
+  // A damaged stored value is rejected on read instead of silently used.
+  await writeFile(join(home, 'delegation.json'), JSON.stringify({ enabled: true, executor: 'qoder', qoder_permission: 'plan' }));
+  await assert.rejects(readDelegation(home));
+});
+
+test('Qoder delegation uses only the live catalog and keeps DSH permissions separate', async t => {
+  const home = await fixture(t);
+  const book = new OrderBook(home);await book.open();
+  const advertise = catalog => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog }, 'qoder');
+  await advertise({ models: [{ provider: 'qoder', model: 'Auto', name: 'Auto', efforts: [] }] });
+  const saved = await saveDelegation(home, { enabled: true, executor: 'qoder', route: { provider: 'qoder', model: 'Auto' } });
+  assert.equal(saved.executor, 'qoder');
+  assert.deepEqual(saved.route, { provider: 'qoder', model: 'Auto' });
+  assert.equal(saved.dsh_permission, undefined);
+  const context = await delegationContext(home);
+  assert.match(context, /executor: "qoder"/);
+  assert.match(context, /provider: "qoder", model: "Auto"/);
+  assert.doesNotMatch(context, /dsh_permission|read-only/);
+  // Unknown models and unadvertised efforts are rejected instead of guessed.
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'qoder', route: { provider: 'qoder', model: 'Missing' } }), /所选模型当前不可用/);
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'qoder', route: { provider: 'qoder', model: 'Auto' }, effort: 'high' }), /思考强度当前不可用/);
+  // An unchanged pinned route stays saveable offline; selecting a different
+  // model still requires the executor to be connected.
+  await saveDelegation(home, { enabled: false, executor: 'qoder', route: { provider: 'qoder', model: 'Auto' } });
+  await book.runtime({ active: false, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } }, 'qoder');
+  await assert.rejects(saveDelegation(home, { enabled: true, executor: 'qoder', route: { provider: 'qoder', model: 'Missing' } }), /执行端未连接/);
 });
 
 test('panel_settings persists the DSH permission through the in-memory app-only MCP surface', async t => {
@@ -308,7 +379,7 @@ test('panel_settings persists the DSH permission through the in-memory app-only 
   await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } });
   const stale = await settings({ enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' });
   assert.equal(stale.isError, true);
-  assert.match(stale.content[0].text, /未加载新会话权限控制/);
+  assert.match(stale.content[0].text, /未提供新会话权限/);
   assert.equal((await readDelegation(home)).dsh_permission, 'read-only');
   await advertise();
   assert.equal((await settings({ enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' })).isError, undefined);
@@ -333,8 +404,9 @@ test('panel refresh targets the stored or selected executor and returns without 
   await call({});assert.deepEqual(refreshed, []);
   assert.equal((await call({ refresh_models: true })).structuredContent.delegation.executor, 'dsh');
   await call({ refresh_models: true, executor: 'hermes' });
-  assert.deepEqual(refreshed, ['dsh', 'hermes']);
-  assert.equal(healthChecks, 3);
+  await call({ refresh_models: true, executor: 'qoder' });
+  assert.deepEqual(refreshed, ['dsh', 'hermes', 'qoder']);
+  assert.equal(healthChecks, 4);
   assert.equal((await new OrderBook(home).list()).length, 0);
 });
 
@@ -363,15 +435,18 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   assert.match(contents[0].text, /id="delegation-model"/);
   assert.match(contents[0].text, /id="delegation-effort"/);
   assert.match(contents[0].text, /id="delegation-permission"/);
-  assert.match(contents[0].text, /跟随 DSH 默认/);
-  assert.match(contents[0].text, /仅可查看/);
-  assert.match(contents[0].text, /工作区内修改/);
-  assert.match(contents[0].text, /完全权限/);
-  assert.match(contents[0].text, /仅 DSH 新派工会话生效/);
-  // The new field collapses with the existing settings grid on narrow screens
-  // and keeps three balanced tracks when Hermes hides it.
+  // The default option and the native list are rendered from the running
+  // executor's capability, so the static shell only carries a neutral
+  // placeholder. Real option rendering is covered by monitor-client tests.
+  assert.match(contents[0].text, /<option value="">跟随执行端默认<\/option>/);
+  assert.ok(!contents[0].text.includes('<option value="read-only">'), 'no executor-specific option is hardcoded in the shell');
+  assert.match(contents[0].text, /hermes_permission/);
+  assert.match(contents[0].text, /qoder_permission/);
+  assert.match(contents[0].text, /permission_control/);
+  // The always-present fourth field uses the shared responsive grid; no
+  // executor-specific track count remains.
   assert.match(contents[0].text, /@media\(max-width:820px\)/);
-  assert.match(contents[0].text, /settings-fields\.no-dsh/);
+  assert.ok(!contents[0].text.includes('settings-fields.no-dsh'), 'the old DSH-only grid class is gone');
   assert.match(contents[0].text, /@media\(max-width:560px\)[\s\S]*?settings-fields/);
   assert.match(contents[0].text, /id="update"/);
   assert.match(contents[0].text, /id="update-refresh"/);
@@ -990,8 +1065,7 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   assert.match(html, /id="update-refresh"/);
   assert.match(html, /id="delegation-effort"/);
   assert.match(html, /id="delegation-permission"/);
-  assert.match(html, /仅可查看/);
-  assert.match(html, /完全权限/);
+  assert.match(html, /跟随执行端默认/);
   assert.match(html, /author: /);
   assert.match(html, /SDD 共享工作区/);
   assert.match(html, /SDD文档保存在此工作区。项目用于分类，任务各存一份task.md。/);
@@ -1014,20 +1088,25 @@ test('read-only HTTP monitor serves the shared-doc shell but still rejects write
   assert.equal(await write.text(), 'Read-only monitor.');
 });
 
-test('the board shell carries the compact DSH permission picker without widening the shared layout', async () => {
+test('the board shell exposes one shared new-session permission field for every executor', async () => {
   // Read the source directly: this stays verifiable even where spawning the
   // native MCP backend is blocked by the host environment.
   const html = await readFile(new URL('../src/monitor.html', import.meta.url), 'utf8');
+  const client = await readFile(new URL('../src/monitor-client.js', import.meta.url), 'utf8');
   assert.match(html, /id="delegation-permission"/);
-  assert.match(html, /<option value="">跟随 DSH 默认<\/option>/);
-  assert.match(html, /<option value="read-only">仅可查看<\/option>/);
-  assert.match(html, /<option value="workspace-write">工作区内修改<\/option>/);
-  assert.match(html, /<option value="danger-full-access">完全权限<\/option>/);
-  assert.match(html, /仅 DSH 新派工会话生效/);
-  // Four equal tracks for DSH, three when Hermes hides the field, and the
-  // existing narrow-screen collapse rules still win.
+  // The list is rendered from the running executor's heartbeat, so the static
+  // shell only carries a neutral default and claims no native option.
+  assert.match(html, /<option value="">跟随执行端默认<\/option>/);
+  assert.doesNotMatch(html, /<option value="read-only">/);
+  assert.doesNotMatch(html, /\.settings-fields\.no-dsh/);
   assert.match(html, /\.settings-fields\{[^}]*grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
-  assert.match(html, /\.settings-fields\.no-dsh\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)\}/);
-  assert.match(html, /@media\(max-width:820px\)\{[\s\S]*?\.settings-fields,\.settings-fields\.no-dsh\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/);
-  assert.match(html, /@media\(max-width:560px\)\{[\s\S]*?\.settings-fields,\.settings-fields\.no-dsh,/);
+  assert.match(html, /@media\(max-width:820px\)\{[\s\S]*?\.settings-fields\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}/);
+  assert.match(html, /@media\(max-width:560px\)\{[\s\S]*?\.settings-fields,/);
+  // Each executor keeps its own stored field; the board saves only the current
+  // executor's field and renders capability-driven options.
+  assert.match(client, /dsh_permission/);
+  assert.match(client, /hermes_permission/);
+  assert.match(client, /qoder_permission/);
+  assert.match(client, /permission_control/);
+  assert.match(client, /仅新会话生效/);
 });

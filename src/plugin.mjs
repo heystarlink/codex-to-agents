@@ -21,11 +21,11 @@ export async function preparePlugin(home, { root = fileURLToPath(new URL('../.lo
     mkdir(join(plugin, '.codex-plugin'), { recursive: true }), mkdir(join(plugin, 'hooks'), { recursive: true })]);
   const hookCommand = [hookNode, entry, 'delegation-hook', '--home', home].map(quote).join(' ');
   await book.atomic(join(plugin, '.codex-plugin', 'plugin.json'), {
-    name: 'agents-board', version: '0.1.0', description: 'Codex 左侧 Agents 看板：手动切换自动派工，选择 Hermes、DSH 及其可用模型。',
-    author: { name: 'heystarlink' }, mcpServers: './.mcp.json', hooks: './hooks/hooks.json',
+    name: 'agents-board', version: '0.1.0', description: 'Codex 左侧 Agents 看板：手动切换自动派工，选择 Hermes、DSH 或 Qoder 及其可用模型。',
+    author: { name: 'sneezeforever' }, mcpServers: './.mcp.json', hooks: './hooks/hooks.json',
     interface: { displayName: 'Agents 看板', shortDescription: '开关自动派工，选择执行端与可用模型。',
-      longDescription: 'Codex 内嵌 Agents 看板。自动派工默认关闭，由用户在看板中开启并选择执行端、模型；Codex 负责拆解、跟进和验收。首次使用自动派工需要在 Codex 审核并信任插件 Hook。',
-      developerName: 'heystarlink', category: 'Developer Tools', capabilities: ['Read', 'Write'], brandColor: '#46734D' },
+      longDescription: 'Codex 内嵌 Agents 看板。自动派工默认关闭，由用户在看板中开启并选择执行端（Hermes、DSH 或 Qoder）、模型；Codex 负责拆解、跟进和验收。首次使用自动派工需要在 Codex 审核并信任插件 Hook。',
+      developerName: 'sneezeforever', category: 'Developer Tools', capabilities: ['Read', 'Write'], brandColor: '#46734D' },
   });
   await book.atomic(join(plugin, '.mcp.json'), { mcpServers: { agents_board: {
     ...connection, startup_timeout_sec: 20,

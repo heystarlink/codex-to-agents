@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, readFile, readdir, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -14,6 +14,8 @@ class NativeHermes {
   constructor() {
     this.socket = { readyState: 1 };this.generation = randomUUID();
     this.sessions = new Map();this.prompts = [];this.interrupted = [];
+    this.calls = [];this.yolo = new Map();this.globalYoloWrites = 0;
+    this.permissionSetMode = null;this.permissionInfo = 'full';
     this.options = { provider: 'deepseek', model: 'flash', providers: [
       { slug: 'deepseek', authenticated: true, models: ['flash'], capabilities: { flash: { reasoning: true } } },
       { slug: 'unconfigured', authenticated: false, models: ['unavailable'] },
@@ -33,6 +35,7 @@ class NativeHermes {
   }
   async call(method, params = {}) {
     if (this.offline) throw new Error('Hermes is offline');
+    this.calls.push({ method, params: { ...params } });
     if (method === 'session.active_list') return { sessions: [...this.sessions.values()] };
     if (method === 'session.create') {
       const key = `stored-${this.sessions.size + 1}`;
@@ -42,7 +45,24 @@ class NativeHermes {
     }
     if (method === 'session.resume' || method === 'session.activate') {
       const session = this.sessions.get(params.session_id) ?? this.byLive(params.session_id);
-      return { session_id: session.id, session_key: session.session_key, resumed: session.session_key, info: { provider: this.reportedProvider ?? session.provider, model: session.model } };
+      const info = { provider: this.reportedProvider ?? session.provider, model: session.model };
+      if (this.permissionInfo === 'full') info.yolo = this.yolo.get(session.session_key) ?? false;
+      return { session_id: session.id, session_key: session.session_key, resumed: session.session_key, info };
+    }
+    if (method === 'config.set') {
+      if (params.key !== 'yolo') throw Object.assign(new Error(`unexpected config key ${params.key}`), { definite: true });
+      const session = this.byLive(params.session_id) ?? this.sessions.get(params.session_id);
+      if (!session) throw new Error('session missing');
+      if (params.scope === 'global') {
+        this.globalYoloWrites++;
+        throw new Error('a fixture global write must never happen');
+      }
+      if (this.permissionSetMode === 'reject') throw new Error('native setter rejected the session flag');
+      if (this.permissionSetMode === 'missing-scope') return { key: 'yolo', value: '1' };
+      if (this.permissionSetMode === 'global-scope') return { key: 'yolo', value: '1', scope: 'global' };
+      const enable = String(params.value) === '1';
+      if (enable) this.yolo.set(session.session_key, true); else this.yolo.delete(session.session_key);
+      return { key: 'yolo', value: enable ? '1' : '0', scope: 'session' };
     }
     const session = this.byLive(params.session_id);
     if (method === 'prompt.submit') {
@@ -71,7 +91,7 @@ async function fixture(t) {
   const directory = join(home, 'project');await mkdir(directory);
   const book = new OrderBook(home);await book.open();
   const native = new NativeHermes();
-  const settings = { home, defaultDirectory: directory, providers: ['deepseek'] };
+  const settings = { home, defaultDirectory: directory, providers: ['deepseek'], permissionReadbackTimeoutMs: 250 };
   const opened = [];
   const worker = async () => {
     native.socket.readyState = 1;native.generation = randomUUID();
@@ -249,4 +269,138 @@ test('follow-ups resolve the canonical custom provider from native metadata inst
   assert.equal((await f.book.inspect(follow.order_id)).route.provider, 'custom:example');
   session.model_config = JSON.stringify({ provider: 'custom:forbidden' });
   await assert.rejects(consumer.desktop.checkpoint('stored-1'), /outside the worker allowlist/);
+});
+
+async function setHermesBoard(home, extra = {}) {
+  await writeFile(join(home, 'delegation.json'), JSON.stringify({ enabled: true, executor: 'hermes', ...extra }));
+}
+
+test('a saved Hermes yolo permission is applied with config.set session scope before the prompt and read back', async t => {
+  const f = await fixture(t);
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const order = await f.book.submit('work_submit', { executor: 'hermes', goal: 'approved turn' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const state = await f.book.inspect(order.order_id);
+  assert.equal(state.status, 'executing');
+  const session = f.native.sessions.get(state.conversation_id);
+  const setIndex = f.native.calls.findIndex(call => call.method === 'config.set');
+  const promptIndex = f.native.calls.findIndex(call => call.method === 'prompt.submit');
+  assert.ok(setIndex >= 0, 'the session flag must be written');
+  assert.ok(promptIndex > setIndex, 'the permission is applied before the first prompt');
+  // Never a global write: only the new session id and the native value.
+  assert.deepEqual(f.native.calls[setIndex].params, { key: 'yolo', session_id: session.id, value: '1' });
+  assert.equal(f.native.globalYoloWrites, 0);
+  assert.equal(f.native.yolo.get(session.session_key), true);
+
+  f.native.complete(state.conversation_id, 'DONE');await consumer.tick();
+  const done = await f.book.inspect(order.order_id);
+  assert.equal(done.status, 'completed');
+  assert.deepEqual(done.output.permission, {
+    preset: 'yolo', scope: 'session', readback: 'session.info', effective_yolo: true,
+  });
+  assert.equal(done.output.native_yolo, null);
+
+  const catalog = await consumer.desktop.describe();
+  assert.equal(catalog.permission_control.available, true);
+  assert.deepEqual(catalog.permission_control.presets, ['yolo']);
+  assert.equal(catalog.permission_control.default.label, '跟随 Hermes 默认');
+  assert.doesNotMatch(catalog.permission_control.default.label, /人工确认|manual/, 'the default must not claim which global approval mode is active');
+  assert.match(catalog.permission_control.limitations.join(' '), /不修改全局审批设置|不提供文件系统沙箱/);
+});
+
+test('following the Hermes default sends no permission RPC', async t => {
+  const f = await fixture(t);
+  const order = await f.book.submit('work_submit', { executor: 'hermes', goal: 'native default turn' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const state = await f.book.inspect(order.order_id);
+  assert.equal(state.status, 'executing');
+  assert.equal(f.native.calls.filter(call => call.method === 'config.set').length, 0);
+  f.native.complete(state.conversation_id, 'DONE');await consumer.tick();
+  const done = await f.book.inspect(order.order_id);
+  assert.equal(done.status, 'completed');
+  assert.equal(done.output.permission, null);
+  assert.equal(done.output.native_yolo, null);
+});
+
+test('a rejected or non-session-scoped setter response blocks Hermes dispatch before any prompt', async t => {
+  const f = await fixture(t);
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const { consumer } = await f.worker();
+  for (const mode of ['reject', 'missing-scope', 'global-scope']) {
+    f.native.permissionSetMode = mode;
+    const order = await f.book.submit('work_submit', { executor: 'hermes', goal: `setter mode ${mode}` });
+    await consumer.tick();
+    const state = await f.book.inspect(order.order_id);
+    assert.equal(state.status, 'failed', `${mode} must not silently start the session`);
+    assert.match(state.error, /未应用新会话权限|按会话范围确认/);
+  }
+  assert.equal(f.native.prompts.length, 0, 'no prompt may reach the native session');
+  assert.equal(f.native.globalYoloWrites, 0);
+});
+
+test('an unreadable yolo field stays honest: setter confirmation is recorded as setter-only', async t => {
+  const f = await fixture(t);
+  f.native.permissionInfo = 'omit';
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const order = await f.book.submit('work_submit', { executor: 'hermes', goal: 'setter only readback' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const state = await f.book.inspect(order.order_id);
+  assert.equal(state.status, 'executing');
+  f.native.complete(state.conversation_id, 'DONE');await consumer.tick();
+  const done = await f.book.inspect(order.order_id);
+  assert.deepEqual(done.output.permission, {
+    preset: 'yolo', scope: 'session', readback: 'setter-only', effective_yolo: null,
+  });
+});
+
+test('a damaged Hermes permission value fails before a native session is created', async t => {
+  const f = await fixture(t);
+  await setHermesBoard(f.home, { hermes_permission: 'smart' });
+  const order = await f.book.submit('work_submit', { executor: 'hermes', goal: 'never created' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const state = await f.book.inspect(order.order_id);
+  assert.equal(state.status, 'failed');
+  assert.match(state.error, /新会话权限设置值不受支持/);
+  assert.equal(f.native.sessions.size, 0);
+});
+
+test('Hermes follow-ups neither re-read the board nor rewrite the native session permission', async t => {
+  const f = await fixture(t);
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const parent = await f.book.submit('work_submit', { executor: 'hermes', goal: 'first' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const first = await f.book.inspect(parent.order_id);
+  f.native.complete(first.conversation_id, 'FIRST');await consumer.tick();
+  const sets = f.native.calls.filter(call => call.method === 'config.set').length;
+
+  // The board no longer pins a permission; the existing conversation must keep
+  // the recorded one, and the adapter must not write it again.
+  await setHermesBoard(f.home, {});
+  const second = await f.book.submit('work_update', { target_order: parent.order_id, action: 'append', message: 'second' });
+  await consumer.tick();await consumer.tick();
+  const secondState = await f.book.inspect(second.order_id);
+  assert.equal(secondState.status, 'executing');
+  f.native.complete(first.conversation_id, 'SECOND');await consumer.tick();
+  const done = await f.book.inspect(second.order_id);
+  assert.equal(done.status, 'completed');
+  assert.equal(f.native.calls.filter(call => call.method === 'config.set').length, sets, 'a follow-up must not reset permissions');
+  assert.equal(done.output.native_yolo, true, 'the native session kept the original permission');
+  assert.deepEqual(done.output.permission, { preset: 'yolo', scope: 'session', readback: 'session.info', effective_yolo: true });
+});
+
+test('a follow-up of a legacy Hermes task never picks up a permission saved later', async t => {
+  const f = await fixture(t);
+  const parent = await f.book.submit('work_submit', { executor: 'hermes', goal: 'legacy' });
+  const { consumer } = await f.worker();await consumer.tick();
+  const first = await f.book.inspect(parent.order_id);
+  f.native.complete(first.conversation_id, 'FIRST');await consumer.tick();
+
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const second = await f.book.submit('work_update', { target_order: parent.order_id, action: 'append', message: 'later' });
+  await consumer.tick();await consumer.tick();
+  f.native.complete(first.conversation_id, 'SECOND');await consumer.tick();
+  const done = await f.book.inspect(second.order_id);
+  assert.equal(done.status, 'completed');
+  assert.equal(f.native.calls.filter(call => call.method === 'config.set').length, 0);
+  assert.equal(done.output.permission, null);
 });

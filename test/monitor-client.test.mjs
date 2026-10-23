@@ -441,108 +441,159 @@ test('a blocked pending install keeps retry-apply available without offering it 
   assert.equal($('update-apply').disabled, false, 'a still-blocked recovery can be retried again');
 });
 
-test('the DSH permission picker shows only for DSH and saves native preset names', async () => {
+// Minimal backend merge used by these stubs: a save changes only the fields the
+// board sent, and "default" removes exactly one executor's fixed value.
+function mergeSetting(current, input) {
+  const next = { ...current, ...input };
+  for (const field of ['dsh_permission', 'hermes_permission', 'qoder_permission']) {
+    if (input[field] === 'default') delete next[field];
+  }
+  return next;
+}
+
+const NATIVE = {
+  dsh: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'], scope: 'new_session',
+    default: { value: '', label: '跟随 DSH 默认', description: '不修改 DSH 原生权限设置。' },
+    options: [
+      { value: 'read-only', label: '仅可查看', description: '只能查看，不能修改文件。' },
+      { value: 'workspace-write', label: '工作区内修改', description: '可在工作区内修改。' },
+      { value: 'danger-full-access', label: '完全权限', description: '不受工作区限制，风险最高。' },
+    ], limitations: ['仅新会话生效；已有任务沿用原权限。'] },
+  hermes: { available: true, presets: ['yolo'], scope: 'new_session',
+    default: { value: '', label: '跟随 Hermes 默认', description: '不修改会话审批状态。' },
+    options: [{ value: 'yolo', label: '跳过审批（会话级 YOLO）', description: '跳过危险命令审批；不是沙箱。' }],
+    limitations: ['仅新会话生效；已有任务沿用原权限。'] },
+  qoder: { available: true, presets: ['accept_edits', 'dont_ask', 'auto', 'bypass_permissions'], scope: 'new_session',
+    default: { value: '', label: '跟随 Qoder 默认', description: '使用 Qoder 原生默认权限。' },
+    options: [
+      { value: 'accept_edits', label: '自动接受安全编辑', description: '自动批准安全编辑；不覆盖命令，也不是沙箱。' },
+      { value: 'dont_ask', label: '需确认即拒绝', description: '需要确认的操作直接拒绝。' },
+      { value: 'auto', label: '由 Qoder 判断', description: '由 Qoder 按风险决定执行或询问。' },
+      { value: 'bypass_permissions', label: '跳过权限审批', description: '跳过权限审批，风险最高；不是沙箱。' },
+    ], limitations: ['仅新会话生效；已有任务沿用原权限。'] },
+};
+
+test('the shared permission picker follows the selected executor capability and saves only its own field', async () => {
   let setting = { enabled: true, executor: 'dsh', dsh_permission: 'read-only' };
   const calls = [];
   const { $ } = await panelFixture(async (name, input) => {
     calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
-    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    if (name === 'panel_settings') { setting = mergeSetting(setting, input);return setting; }
     return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
-      dsh: { online: true, models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] } },
-      hermes: { online: true, models: [] },
+      dsh: { online: true, models: [], permission_control: NATIVE.dsh },
+      hermes: { online: true, models: [], permission_control: NATIVE.hermes },
+      qoder: { online: true, models: [], permission_control: NATIVE.qoder },
     } } };
   });
-  const field = $('permission-field');
   const select = $('delegation-permission');
-  assert.equal(field.hidden, false);
+  // DSH keeps its native preset list from the heartbeat.
+  assert.deepEqual(select.children.map(option => option.value), ['', 'read-only', 'workspace-write', 'danger-full-access']);
   assert.equal(select.value, 'read-only');
-  assert.equal(select.disabled, false);
-  assert.match($('permission-help').textContent, /仅 DSH 新派工会话生效/);
-  // Every explicit choice is saved as the native preset key, never as a pair.
-  select.value = 'danger-full-access';select.change();await settle();
-  assert.equal(setting.dsh_permission, 'danger-full-access');
-  assert.equal(select.value, 'danger-full-access');
-  // Following the DSH default sends "default" so a stale saved choice clears.
-  select.value = '';select.change();await settle();
-  assert.equal(setting.dsh_permission, 'default');
-  // Hermes hides the field and never carries the DSH-only preference over.
+  assert.match($('permission-help').textContent, /只能查看，不能修改文件。 仅新会话生效/);
+  assert.doesNotMatch($('permission-help').textContent, /--permission-mode|config\.set|init/);
+  select.value = 'workspace-write';select.change();await settle();
+  assert.equal(setting.dsh_permission, 'workspace-write');
+  // Hermes shows its own approval choice and never carries the DSH value.
   $('delegation-executor').value = 'hermes';$('delegation-executor').change();await settle();
-  assert.equal(field.hidden, true);
-  assert.deepEqual(setting, { enabled: true, executor: 'hermes' });
+  assert.deepEqual(select.children.map(option => option.value), ['', 'yolo']);
+  assert.equal(select.value, '');
+  assert.match($('permission-help').textContent, /不修改会话审批状态。 仅新会话生效/);
+  select.value = 'yolo';select.change();await settle();
+  assert.equal(setting.hermes_permission, 'yolo');
   assert.ok(!calls.some(call => call.name === 'panel_settings' && call.input.executor === 'hermes' && 'dsh_permission' in call.input));
+  // Qoder renders only the modes its running CLI actually declared.
+  $('delegation-executor').value = 'qoder';$('delegation-executor').change();await settle();
+  assert.deepEqual(select.children.map(option => option.value), ['', 'accept_edits', 'dont_ask', 'auto', 'bypass_permissions']);
+  assert.equal(select.value, '');
+  select.value = 'accept_edits';select.change();await settle();
+  assert.equal(setting.qoder_permission, 'accept_edits');
+  assert.ok(!calls.some(call => call.name === 'panel_settings' && call.input.executor === 'qoder' && ('dsh_permission' in call.input || 'hermes_permission' in call.input)));
+  // Switching back keeps each executor's stored choice.
+  $('delegation-executor').value = 'dsh';$('delegation-executor').change();await settle();
+  assert.equal(select.value, 'workspace-write');
+  $('delegation-executor').value = 'hermes';$('delegation-executor').change();await settle();
+  assert.equal(select.value, 'yolo');
+  $('delegation-executor').value = 'qoder';$('delegation-executor').change();await settle();
+  assert.equal(select.value, 'accept_edits');
+  // Choosing the default clears exactly the current executor's field.
+  select.value = '';select.change();await settle();
+  assert.equal('qoder_permission' in setting, false);
+  assert.equal(setting.dsh_permission, 'workspace-write');
+  assert.equal(setting.hermes_permission, 'yolo');
 });
 
-test('a rejected DSH permission save reverts the picker and keeps the field usable', async () => {
-  let setting = { enabled: true, executor: 'dsh', dsh_permission: 'workspace-write' };
-  let reject = false;
-  const { $ } = await panelFixture(async (name, input) => {
-    if (name === 'panel_settings') {
-      if (reject) throw new Error('DSH 未连接，无法保存');
-      setting = JSON.parse(JSON.stringify(input));return setting;
-    }
-    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
-      dsh: { online: true, models: [], permission_control: { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] } },
-    } } };
-  });
-  const select = $('delegation-permission');
-  reject = true;select.value = 'danger-full-access';select.change();await settle();
-  assert.equal(select.value, 'workspace-write', 'a failed save restores the last persisted permission');
-  assert.match($('delegation-message').textContent, /保存失败.*DSH 未连接/);
-  assert.equal(select.disabled, false, 'the picker is usable again after the failure');
-  reject = false;select.value = 'read-only';select.change();await settle();
-  assert.equal(setting.dsh_permission, 'read-only');
-});
-
-test('an old DSH consumer without permission control disables every non-default choice', async () => {
-  // The heartbeat comes from the plugin code that is actually running. An old
-  // consumer omits permission_control, so the board must not show a setting the
-  // old end would silently ignore; only the DSH default stays selectable.
+test('an executor without new-session permission control shows the limitation and only lets the default be chosen', async () => {
   let setting = { enabled: true, executor: 'dsh', dsh_permission: 'danger-full-access' };
   const calls = [];
   const { $ } = await panelFixture(async (name, input) => {
     calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
-    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    if (name === 'panel_settings') { setting = mergeSetting(setting, input);return setting; }
     return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
       dsh: { online: true, models: [] },
+      hermes: { online: true, models: [] },
+      qoder: { online: true, models: [] },
     } } };
   });
-  const field = $('permission-field');
   const select = $('delegation-permission');
-  assert.equal(field.hidden, false);
-  assert.deepEqual(select.children.map(option => option.value), ['', 'read-only', 'workspace-write', 'danger-full-access']);
-  assert.equal(select.children[0].disabled, false);
-  for (const option of select.children.slice(1)) assert.equal(option.disabled, true);
-  assert.equal(select.children.at(-1).textContent, '完全权限（当前不可用）');
+  // The saved value is still visible as unavailable; the default stays usable so
+  // the user can repair the setting without upgrading the running end.
+  assert.deepEqual(select.children.map(option => option.value), ['', 'danger-full-access']);
+  assert.equal(select.children[1].disabled, true);
+  assert.equal(select.children[1].textContent, '完全权限（当前不可用）');
   assert.equal(select.value, 'danger-full-access');
-  assert.equal(select.disabled, false, 'the user can still choose the DSH default');
-  assert.match($('permission-help').textContent, /未加载新会话权限控制.*重新加载.*重启 DSH/);
+  assert.equal(select.disabled, false);
+  assert.match($('permission-help').textContent, /未提供新会话权限控制.*恢复默认/);
   select.value = '';select.change();await settle();
   assert.ok(calls.some(call => call.name === 'panel_settings' && call.input.dsh_permission === 'default'));
 });
 
-test('offline or partially capable DSH consumers keep unsupported presets disabled', async () => {
-  let setting = { enabled: true, executor: 'dsh' };
-  let online = false;
-  let presets = ['read-only', 'workspace-write', 'danger-full-access'];
+test('offline executors cannot confirm permission control while an untouched save stays possible', async () => {
+  let setting = { enabled: true, executor: 'dsh', dsh_permission: 'read-only' };
+  const calls = [];
   const { $, poll } = await panelFixture(async (name, input) => {
-    if (name === 'panel_settings') { setting = JSON.parse(JSON.stringify(input));return setting; }
+    calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
+    if (name === 'panel_settings') { setting = mergeSetting(setting, input);return setting; }
     return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
-      dsh: { online, models: [], permission_control: { available: true, presets } },
+      dsh: { online: false, models: [] },
     } } };
   });
   const select = $('delegation-permission');
-  // Offline: the board cannot verify the running plugin, so explicit choices
-  // stay disabled while the default remains selectable.
-  assert.equal(select.children[0].disabled, false);
-  for (const option of select.children.slice(1)) assert.equal(option.disabled, true);
-  assert.match($('permission-help').textContent, /DSH 未连接/);
-  // Reconnect with only one native preset: disable exactly the missing ones.
-  online = true;presets = ['read-only'];
+  assert.deepEqual(select.children.map(option => option.value), ['', 'read-only']);
+  assert.equal(select.disabled, false, 'the saved value can be cleared while offline');
+  assert.match($('permission-help').textContent, /DSH 未连接.*暂时只能跟随默认/);
+  // Closing the switch saves while the permission is unchanged (no capability
+  // check needed for an unchanged value).
+  $('delegation-switch').checked = false;$('delegation-switch').change();await settle();
+  const save = calls.filter(call => call.name === 'panel_settings').at(-1);
+  assert.equal(save.input.enabled, false);
+  assert.equal('dsh_permission' in save.input, false);
+  // Reconnect with a partial native list: only the advertised option is shown.
+  setting = { enabled: true, executor: 'dsh', dsh_permission: 'read-only' };
   await poll();
-  assert.equal(select.children[1].disabled, false);
+});
+
+test('a saved Qoder mode the running CLI no longer declares is shown unavailable and can be reset', async () => {
+  let setting = { enabled: true, executor: 'qoder', qoder_permission: 'bypass_permissions' };
+  const calls = [];
+  const { $ } = await panelFixture(async (name, input) => {
+    calls.push({ name, input: JSON.parse(JSON.stringify(input)) });
+    if (name === 'panel_settings') { setting = mergeSetting(setting, input);return setting; }
+    return { delegation: JSON.parse(JSON.stringify(setting)), worker: { executors: {
+      qoder: { online: true, models: [], permission_control: {
+        available: true, presets: ['accept_edits'], scope: 'new_session',
+        default: NATIVE.qoder.default,
+        options: [NATIVE.qoder.options[0]],
+        limitations: NATIVE.qoder.limitations,
+      } },
+    } } };
+  });
+  const select = $('delegation-permission');
+  assert.deepEqual(select.children.map(option => option.value), ['', 'accept_edits', 'bypass_permissions']);
   assert.equal(select.children[2].disabled, true);
-  assert.equal(select.children[3].disabled, true);
-  assert.match($('permission-help').textContent, /未提供：工作区内修改、完全权限/);
+  assert.equal(select.value, 'bypass_permissions');
+  assert.equal(select.disabled, false);
+  select.value = '';select.change();await settle();
+  assert.equal(calls.filter(call => call.name === 'panel_settings').at(-1).input.qoder_permission, 'default');
 });
 
 test('auto-update switch persists separately, starts a daily check when enabled, and restores a failed save', async () => {

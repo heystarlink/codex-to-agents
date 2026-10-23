@@ -1,7 +1,9 @@
 import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { HermesClient } from './hermes-client.mjs';
 import { OrderBook } from './orders.mjs';
+import { permissionControl, readExecutorPermission } from './permissions.mjs';
 
 const marker = id => `[codex-to-agents:${id}]`;
 const running = status => ['working', 'waiting', 'starting', 'streaming'].includes(status);
@@ -38,6 +40,10 @@ export class Hermes {
     const providers = data.providers.filter(provider => provider.authenticated !== false && (!allowed?.length || allowed.includes(provider.slug)));
     return {
       executor: 'hermes', default_provider: data.provider, default_model: data.model,
+      // Only the native session-scoped approval bypass is advertised. Global
+      // approvals.mode values are not read or offered, so the default option
+      // makes no claim about which global mode is currently active.
+      permission_control: permissionControl('hermes', ['yolo']),
       capabilities: { directories: true, workspaces: false, follow_up: true, steer: true, cancel: true, conversations: true },
       models: providers.flatMap(provider => provider.models.map(model => ({
         provider: provider.slug, model, name: model, reasoning: Boolean(provider.capabilities?.[model]?.reasoning),
@@ -71,8 +77,61 @@ export class Hermes {
     return !running(this.live.get(id)?.status);
   }
 
+  // The user-owned preference for newly created Hermes sessions. A damaged or
+  // unknown stored value fails before session.create, not after.
+  newSessionPermission() {
+    return readExecutorPermission(this.settings.home, 'hermes');
+  }
+
+  // Apply the native session-scoped YOLO flag before the first prompt. The
+  // gateway's config.set default scope is "session"; this adapter never passes
+  // scope=global, so the persistent approvals.mode is untouched.
+  async applySessionPermission(sessionId, permission) {
+    if (permission !== 'yolo') throw new Error(`不支持的 Hermes 新会话权限：${permission}`);
+    let result;
+    try { result = await this.client.call('config.set', { key: 'yolo', session_id: sessionId, value: '1' }); }
+    catch (error) {
+      throw Object.assign(new Error(`Hermes 未应用新会话权限“跳过审批（会话级 YOLO）”，已阻止派工：${error.message}`), { definite: true });
+    }
+    // The verified runtime returns scope:"session". Require it exactly: an
+    // older implementation that wrote global config must never be accepted as
+    // a session-scoped apply.
+    if (result?.scope !== 'session' || result?.value !== '1') {
+      throw Object.assign(new Error(`Hermes 新会话权限未能按会话范围确认（返回 ${JSON.stringify(result ?? null)}），已阻止派工。`), { definite: true });
+    }
+    // Independent readback: session.activate returns session.info once the
+    // agent is built. Bounded so an unbuilt/slow agent cannot stall dispatch;
+    // when it stays unavailable the setter's own scope/value confirmation is
+    // recorded as such, never presented as an independent effective readback.
+    const info = await this.readPermissionInfo(sessionId);
+    if (info && info.yolo === false) {
+      throw Object.assign(new Error('Hermes 已写入会话级 YOLO，但 session.info 读回仍为关闭，已阻止派工。'), { definite: true });
+    }
+    return {
+      preset: 'yolo', scope: 'session',
+      readback: info ? 'session.info' : 'setter-only',
+      effective_yolo: typeof info?.yolo === 'boolean' ? info.yolo : null,
+    };
+  }
+
+  async readPermissionInfo(sessionId) {
+    const timeout = this.settings.permissionReadbackTimeoutMs ?? 3000;
+    const deadline = Date.now() + timeout;
+    for (;;) {
+      try {
+        const payload = await this.client.call('session.activate', { session_id: sessionId });
+        if (payload?.info && typeof payload.info.yolo === 'boolean') return payload.info;
+      } catch { /* the setter confirmation above is still authoritative */ }
+      if (Date.now() >= deadline) return null;
+      await delay(150);
+    }
+  }
+
   async start(order) {
     const input = order.payload;
+    // Read the user preference first: a damaged value must stop dispatch before
+    // a native session exists.
+    const permission = await this.newSessionPermission();
     if (input.effort && !['default', 'none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(input.effort)) {
       throw new Error('Unsupported Hermes reasoning effort.');
     }
@@ -96,6 +155,10 @@ export class Hermes {
     });
     const location = { conversation_id: result.stored_session_id, native_session_id: result.session_id, directory, route: { provider, model } };
     if (!location.conversation_id || !location.native_session_id) throw Object.assign(new Error('Hermes returned no persistent session identity.'), { deliveryUnknown: true });
+    // Apply and confirm before any prompt is submitted. A failure leaves the
+    // task unsubmitted and blocks dispatch instead of running with another
+    // permission.
+    location.permission = permission ? await this.applySessionPermission(location.native_session_id, permission) : null;
     this.live.set(location.conversation_id, { id: location.native_session_id, session_key: location.conversation_id, status: 'starting' });
     return location;
   }
@@ -111,8 +174,15 @@ export class Hermes {
     if (this.settings.providers?.length && !this.settings.providers.includes(provider)) {
       throw new Error('The Hermes conversation provider is outside the worker allowlist or cannot be confirmed.');
     }
+    // A follow-up keeps the original task's recorded permission and never
+    // re-reads the board. The native session flag is gateway-memory state; it is
+    // reported as read, not rewritten here (native state and the user's own
+    // toggle stay authoritative for an existing conversation).
+    const original = [...this.turns.values()].find(receipt => receipt.conversation_id === id);
     return { conversation_id: result.session_key ?? result.resumed ?? id, native_session_id: result.session_id,
-      route: { provider, model: result.info?.model } };
+      route: { provider, model: result.info?.model },
+      permission: original?.permission ?? null,
+      native_yolo: typeof result.info?.yolo === 'boolean' ? result.info.yolo : null };
   }
 
   async send(order, location, message, mode) {
@@ -121,7 +191,8 @@ export class Hermes {
       if (result.status !== 'queued') throw Object.assign(new Error('Hermes did not accept the steer instruction. Use append when the conversation is idle.'), { definite: true });
       return { status: 'completed', progress: 'Steer instruction accepted by Hermes.', output: { steer_accepted: true, conversation_id: location.conversation_id } };
     }
-    const receipt = { order_id: order.id, ...location, attached_generation: this.client.generation, status: 'executing', progress: 'Message submitted to Hermes.', text: '' };
+    const receipt = { order_id: order.id, ...location, attached_generation: this.client.generation, status: 'executing', progress: 'Message submitted to Hermes.', text: '',
+      permission: location.permission ?? null, native_yolo: location.native_yolo ?? null };
     this.turns.set(order.id, receipt);this.byLive.set(location.native_session_id, order.id);
     await this.save(receipt);
     let result;
@@ -129,7 +200,8 @@ export class Hermes {
     catch (error) {
       if (error.definite) {
         receipt.status = 'failed';receipt.progress = error.message;
-        receipt.output = { text: error.message, native_status: 'rejected', conversation_id: location.conversation_id };
+        receipt.output = { text: error.message, native_status: 'rejected', conversation_id: location.conversation_id,
+          permission: location.permission ?? null, native_yolo: location.native_yolo ?? null };
         this.byLive.delete(location.native_session_id);await this.save(receipt);
       }
       throw error;
@@ -157,7 +229,8 @@ export class Hermes {
         : payload.status === 'interrupted' ? 'cancelled' : 'failed';
       receipt.status = status;
       receipt.text = String(payload.text ?? payload.message ?? receipt.text).slice(-20000);
-      receipt.output = { text: receipt.text, native_status: payload.status ?? 'error', conversation_id: receipt.conversation_id };
+      receipt.output = { text: receipt.text, native_status: payload.status ?? 'error', conversation_id: receipt.conversation_id,
+        permission: receipt.permission ?? null, native_yolo: receipt.native_yolo ?? null };
       receipt.progress = receipt.text;
       this.byLive.delete(event.session_id);
     } else return;

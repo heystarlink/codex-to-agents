@@ -110,14 +110,17 @@ test('a wildcard provider list follows the currently loaded DSH providers and is
   };
   const desktop = new Desktop({ llm, agentDefaultModel: { currentSelection: () => ({ provider: 'account', model: 'flash' }) } },
     { providers: ['*'] });
-  assert.deepEqual(await desktop.describe(), {
-    models: [
-      { provider: 'account', model: 'flash', name: 'Flash', efforts: ['low'], default_effort: 'low' },
-      { provider: 'other', model: 'flash', name: 'Flash', efforts: ['low'], default_effort: 'low' },
-    ],
-    unavailable_providers: ['broken'],
-    permission_control: { available: false, presets: [] },
-  });
+  const catalog = await desktop.describe();
+  assert.deepEqual(catalog.models, [
+    { provider: 'account', model: 'flash', name: 'Flash', efforts: ['low'], default_effort: 'low' },
+    { provider: 'other', model: 'flash', name: 'Flash', efforts: ['low'], default_effort: 'low' },
+  ]);
+  assert.deepEqual(catalog.unavailable_providers, ['broken']);
+  assert.equal(catalog.permission_control.available, false);
+  assert.deepEqual(catalog.permission_control.presets, []);
+  assert.deepEqual(catalog.permission_control.options, []);
+  assert.equal(catalog.permission_control.scope, 'new_session');
+  assert.equal(catalog.permission_control.default.label, '跟随 DSH 默认');
   assert.deepEqual(queried, ['account', 'broken', 'other']);
   assert.deepEqual(await desktop.choose({ provider: 'other' }), { provider: 'other', model: 'flash', reasoningEffort: 'low' });
   await assert.rejects(desktop.choose({ provider: 'broken' }), /not available/);
@@ -139,18 +142,35 @@ test('the heartbeat advertises native permission control so older consumers are 
     async set() {}, current() { return 'read-only'; },
   };
   const available = new Desktop({ llm, get: name => name === 'permissionPresets' ? native : undefined }, { providers: ['account'] });
-  assert.deepEqual((await available.describe()).permission_control,
-    { available: true, presets: ['read-only', 'workspace-write', 'danger-full-access'] });
+  const control = (await available.describe()).permission_control;
+  assert.deepEqual(control, {
+    available: true,
+    presets: ['read-only', 'workspace-write', 'danger-full-access'],
+    scope: 'new_session',
+    default: { value: '', label: '跟随 DSH 默认', description: '不修改 DSH 原生权限设置。' },
+    options: [
+      { value: 'read-only', label: '仅可查看', description: '只能查看，不能修改文件。' },
+      { value: 'workspace-write', label: '工作区内修改', description: '可在工作区内修改。' },
+      { value: 'danger-full-access', label: '完全权限', description: '不受工作区限制，风险最高。' },
+    ],
+    limitations: ['仅新会话生效；已有任务沿用原权限。'],
+  });
   // A partial service (catalog only) must not be advertised as usable: the
   // adapter also needs set() and current() to apply and verify a preset.
   const partial = new Desktop({ llm, get: name => name === 'permissionPresets' ? { catalog: native.catalog } : undefined }, { providers: ['account'] });
-  assert.deepEqual((await partial.describe()).permission_control, { available: false, presets: [] });
+  const partialControl = (await partial.describe()).permission_control;
+  assert.equal(partialControl.available, false);
+  assert.deepEqual(partialControl.presets, []);
   // A plugin whose native catalog fails still loads; the board sees "unavailable"
   // instead of assuming permission_control exists.
   const broken = new Desktop({ llm, get: name => name === 'permissionPresets' ? { catalog() { throw new Error('unavailable'); }, async set() {}, current() {} } : undefined }, { providers: ['account'] });
-  assert.deepEqual((await broken.describe()).permission_control, { available: false, presets: [] });
+  const brokenControl = (await broken.describe()).permission_control;
+  assert.equal(brokenControl.available, false);
+  assert.deepEqual(brokenControl.presets, []);
   const missing = new Desktop({ llm, get: () => undefined }, { providers: ['account'] });
-  assert.deepEqual((await missing.describe()).permission_control, { available: false, presets: [] });
+  const missingControl = (await missing.describe()).permission_control;
+  assert.equal(missingControl.available, false);
+  assert.deepEqual(missingControl.presets, []);
 });
 
 test('wildcard routing stops new work and follow-ups once DSH unloads a provider', async () => {
@@ -190,11 +210,10 @@ test('the explicit provider allowlist is preserved and mixing it with a wildcard
   assert.throws(() => new Desktop({ llm }, { providers: ['*', 'account'] }), /not both/);
   const desktop = new Desktop({ llm, agentDefaultModel: { currentSelection: () => ({ provider: 'account', model: 'flash' }) } },
     { providers: ['account', 'retired'] });
-  assert.deepEqual(await desktop.describe(), {
-    models: [{ provider: 'account', model: 'flash', name: 'Flash', efforts: [], default_effort: null }],
-    unavailable_providers: ['retired'],
-    permission_control: { available: false, presets: [] },
-  });
+  const catalog = await desktop.describe();
+  assert.deepEqual(catalog.models, [{ provider: 'account', model: 'flash', name: 'Flash', efforts: [], default_effort: null }]);
+  assert.deepEqual(catalog.unavailable_providers, ['retired']);
+  assert.equal(catalog.permission_control.available, false);
   assert.deepEqual(await desktop.choose({}), { provider: 'account', model: 'flash' });
   await assert.rejects(desktop.choose({ provider: 'other' }), /outside/);
   await assert.rejects(desktop.choose({ provider: 'retired' }), /not loaded/);

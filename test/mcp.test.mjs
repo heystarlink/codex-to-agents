@@ -368,7 +368,7 @@ test('work_submit blocks a saved DSH permission the running consumer cannot hono
     await heartbeat();
     const blocked = await call('work_submit', { goal: 'must not queue' });
     assert.equal(blocked.isError, true);
-    assert.match(blocked.content[0].text, /未加载权限控制.*重新加载.*重启 DSH/);
+    assert.match(blocked.content[0].text, /未提供该权限.*更新并重新加载/);
     assert.deepEqual(await book.list(), [], 'a blocked work_submit saves no order');
     // The same submission is accepted when the running plugin advertises the
     // saved preset, so the guard does not block a correctly updated DSH.
@@ -382,9 +382,11 @@ test('work_submit blocks a saved DSH permission the running consumer cannot hono
     const offline = await call('work_submit', { goal: 'must not queue offline' });
     assert.equal(offline.isError, true);
     assert.match(offline.content[0].text, /DSH 当前未连接/);
-    // The DSH-only preference never blocks Hermes work.
+    // Another executor's stored preference never blocks Hermes or Qoder work.
     const hermes = await call('work_submit', { executor: 'hermes', goal: 'hermes work' });
     assert.equal(hermes.isError, undefined);
+    const qoder = await call('work_submit', { executor: 'qoder', goal: 'qoder work' });
+    assert.equal(qoder.isError, undefined);
   } finally {
     await client.close();await server.close();await rm(home, { recursive: true, force: true });
   }
@@ -430,6 +432,46 @@ test('an existing work order stays idempotent when DSH later loses permission ca
     assert.match(conflict.content[0].text, /already bound to different work/);
     assert.equal((await book.request(orderId)).payload.goal, 'retry-safe work');
     assert.equal((await book.list()).length, 1);
+  } finally {
+    await client.close();await server.close();await rm(home, { recursive: true, force: true });
+  }
+});
+
+
+test('work_submit blocks Hermes and Qoder saved permissions their running consumer cannot honor', async () => {
+  const home = await mkdtemp('/tmp/cw-mcp-permission-cross-');
+  const server = await createMcp(home);
+  const client = new Client({ name: 'permission-cross-test', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(a);await client.connect(b);
+    const book = new OrderBook(home);await book.open();
+    const call = (name, args = {}) => client.callTool({ name, arguments: args });
+    const heartbeat = (executor, catalog) => book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog }, executor);
+    await writeFile(join(home, 'delegation.json'), JSON.stringify({
+      enabled: true, executor: 'hermes', hermes_permission: 'yolo', qoder_permission: 'accept_edits',
+    }));
+    // Old Hermes consumer: no capability advertised.
+    await heartbeat('hermes', { models: [] });
+    const hermesBlocked = await call('work_submit', { executor: 'hermes', goal: 'blocked hermes' });
+    assert.equal(hermesBlocked.isError, true);
+    assert.match(hermesBlocked.content[0].text, /Hermes.*未提供该权限/);
+    // Old Qoder consumer: no capability advertised.
+    await heartbeat('qoder', { models: [] });
+    const qoderBlocked = await call('work_submit', { executor: 'qoder', goal: 'blocked qoder' });
+    assert.equal(qoderBlocked.isError, true);
+    assert.match(qoderBlocked.content[0].text, /Qoder.*未提供该权限/);
+    assert.deepEqual(await book.list(), [], 'blocked submissions save no order');
+    // Correctly updated consumers accept their own native values.
+    await heartbeat('hermes', { models: [], permission_control: { available: true, presets: ['yolo'] } });
+    await heartbeat('qoder', { models: [], permission_control: { available: true, presets: ['accept_edits', 'dont_ask', 'auto', 'bypass_permissions'] } });
+    assert.equal((await call('work_submit', { executor: 'hermes', goal: 'hermes allowed' })).isError, undefined);
+    assert.equal((await call('work_submit', { executor: 'qoder', goal: 'qoder allowed' })).isError, undefined);
+    // A damaged stored value blocks instead of being ignored.
+    await writeFile(join(home, 'delegation.json'), JSON.stringify({ enabled: true, executor: 'hermes', hermes_permission: 'manual' }));
+    const damaged = await call('work_submit', { executor: 'hermes', goal: 'damaged' });
+    assert.equal(damaged.isError, true);
+    assert.match(damaged.content[0].text, /自动派工设置无法读取|无法解析|不受支持/);
   } finally {
     await client.close();await server.close();await rm(home, { recursive: true, force: true });
   }

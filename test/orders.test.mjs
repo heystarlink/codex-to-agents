@@ -80,6 +80,28 @@ test('an interrupted dispatch becomes uncertain and is observed instead of repla
   await worker.tick();assert.equal((await f.book.inspect(order.order_id)).status, 'completed');
 });
 
+test('Qoder inherits its executor, rejects desktop workspaces, and keeps legacy consumer protection', async t => {
+  const f = await environment(t);
+  const parent = await f.book.submit('work_submit', { executor: 'qoder', goal: 'qoder first', directory: '/tmp' });
+  assert.equal(parent.executor, 'qoder');
+  const update = await f.book.submit('work_update', { target_order: parent.order_id, action: 'append', message: 'next' });
+  assert.equal(update.executor, 'qoder');
+  assert.equal((await f.book.request(update.order_id)).payload.executor, 'qoder');
+  await assert.rejects(f.book.submit('work_update', { executor: 'dsh', target_order: parent.order_id, action: 'cancel' }), /must match/);
+  await assert.rejects(f.book.submit('work_submit', { executor: 'qoder', goal: 'x', workspace_id: 'dsh-project' }), /not supported/);
+  await assert.rejects(f.book.submit('workspace_control', { executor: 'qoder', action: 'list' }), /not supported/);
+  // A legacy DSH consumer could steal non-DSH orders, so publication blocks until reload.
+  const snapshot = { active: true, pid: process.pid, at: new Date().toISOString() };
+  await f.book.runtime(snapshot);
+  await assert.rejects(f.book.submit('work_submit', { executor: 'qoder', goal: 'do not misroute' }), /legacy consumer/);
+  await f.book.runtime({ ...snapshot, protocol: 2 });
+  const safe = await f.book.submit('work_submit', { executor: 'qoder', goal: 'safe after reload' });
+  assert.equal(safe.executor, 'qoder');
+  await f.book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog: { models: [] } }, 'qoder');
+  assert.equal((await f.book.runtime(null, 'qoder')).online, true);
+  assert.equal((await f.book.runtimes()).executors.qoder.online, true);
+});
+
 test('only one consumer may own the directory, and offline status is saved when it closes', async t => {
   const f = await environment(t);
   const first = await f.consumer();await first.tick();

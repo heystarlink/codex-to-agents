@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, access } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { extensionBlock, stripExtension, install, prepareDshExtension } from '../src/command.mjs';
-import { definitions } from '../src/orders.mjs';
+import { definitions, OrderBook } from '../src/orders.mjs';
+import { createQoderFixture } from './fixtures/qoder-cli-fixture.mjs';
 
 test('reinstall removes only its extension and preserves provider patches Cordis saved inside the markers', () => {
   const own = extensionBlock({ home: '/data', defaultDirectory: '/work', providers: ['*'] });
@@ -54,6 +55,9 @@ test('the DSH runtime snapshot keeps the complete local import closure and still
   assert.ok(copied.includes('desktop.mjs'));
   assert.ok(copied.includes('worker.mjs'));
   assert.ok(copied.includes('orders.mjs'));
+  // The shared executor registry is imported by worker/orders, so the installed
+  // snapshot must carry it too.
+  assert.ok(copied.includes('executors.mjs'));
   // Resolve every relative import of every copied module and require its target
   // to exist in the snapshot itself.
   for (const name of copied.filter(file => file.endsWith('.mjs'))) {
@@ -70,13 +74,65 @@ test('the DSH runtime snapshot keeps the complete local import closure and still
   assert.equal(typeof loaded.apply, 'function');
 });
 
-test('model-facing work orders cannot persist the DSH-only permission preference', () => {
+test('Qoder enable verifies the executable, stores discovery results and keeps history on disable', async t => {
+  const root = await mkdtemp('/tmp/cta-qoder-command-');
+  const previousHome = process.env.HOME;
+  process.env.HOME = join(root, 'home');
+  await mkdir(join(root, 'home', '.codex'), { recursive: true });
+  t.after(async () => { process.env.HOME = previousHome;await rm(root, { recursive: true, force: true }); });
+  const cli = await createQoderFixture(t);
+  const home = join(root, 'data');
+  const registered = [];
+  const register = async value => { registered.push(value); };
+  const enabled = await install({
+    home, executor: 'qoder', action: 'enable',
+    'qoder-executable': cli.executable, directory: join(root, 'work'),
+  }, { register });
+  assert.equal(enabled.configured, true);
+  assert.equal(enabled.executor, 'qoder');
+  assert.equal(enabled.executable, cli.executable);
+  assert.equal(enabled.version, cli.version);
+  assert.equal(enabled.login_required, true);
+  assert.deepEqual(registered, [home]);
+  const saved = JSON.parse(await readFile(join(home, 'settings.json'), 'utf8'));
+  assert.equal(saved.qoder.executable, cli.executable);
+  assert.equal(saved.qoder.version, cli.version);
+  assert.equal(saved.qoder.defaultDirectory, join(root, 'work'));
+  await access(saved.qoder.defaultDirectory);
+  assert.ok((await readdir(join(home, 'backups'))).length >= 1);
+
+  const book = new OrderBook(home);await book.open();
+  const order = await book.submit('work_submit', { executor: 'qoder', goal: 'retain history' });
+  const disabled = await install({ home, executor: 'qoder', action: 'disable' }, { register });
+  assert.equal(disabled.configured, false);
+  assert.equal('qoder' in JSON.parse(await readFile(join(home, 'settings.json'), 'utf8')), false);
+  assert.equal((await book.inspect(order.order_id)).executor, 'qoder');
+  assert.equal(registered.length, 1, 'disable does not register MCP again');
+});
+
+test('Qoder enable rejects an unverified executable without writing settings', async t => {
+  const root = await mkdtemp('/tmp/cta-qoder-command-bad-');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, 'data');
+  await assert.rejects(
+    install({ home, executor: 'qoder', action: 'enable', 'qoder-executable': '/nonexistent/qodercli' }, { register: async () => {} }),
+    error => error.code === 'QODER_NOT_FOUND',
+  );
+  await assert.rejects(access(join(home, 'settings.json')), { code: 'ENOENT' });
+});
+
+test('model-facing work orders cannot persist any new-session permission preference', () => {
   // Only the app-only board tool writes delegation.json; work_submit and
-  // work_update stay strictly closed so a model cannot raise its own permission.
+  // work_update stay strictly closed so a model cannot raise its own permission
+  // for any executor.
   const submit = { executor: 'dsh', goal: 'Do the work.' };
   assert.equal(definitions.work_submit.schema.safeParse(submit).success, true);
-  assert.equal(definitions.work_submit.schema.safeParse({ ...submit, dsh_permission: 'danger-full-access' }).success, false);
+  for (const field of ['dsh_permission', 'hermes_permission', 'qoder_permission']) {
+    assert.equal(definitions.work_submit.schema.safeParse({ ...submit, [field]: 'read-only' }).success, false, `${field} must not be model-settable`);
+  }
   const update = { target_order: '6f1c5bd8-7b3f-4d02-8f6e-8b2f4a5c9d10', action: 'append', message: 'continue' };
   assert.equal(definitions.work_update.schema.safeParse(update).success, true);
-  assert.equal(definitions.work_update.schema.safeParse({ ...update, dsh_permission: 'read-only' }).success, false);
+  for (const field of ['dsh_permission', 'hermes_permission', 'qoder_permission']) {
+    assert.equal(definitions.work_update.schema.safeParse({ ...update, [field]: 'yolo' }).success, false, `${field} must not be model-settable`);
+  }
 });

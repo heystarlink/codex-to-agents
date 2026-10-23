@@ -126,15 +126,31 @@ test('opting out while preparation is pending prevents both ID creation and uplo
 });
 
 test('timeout cancels a slow upload and close prevents later activity', async t => {
+  // Deterministic clock: on a loaded parallel suite the fixed 15 ms timeout may
+  // fire during preparation I/O before fetch starts, so the request is skipped
+  // correctly but a wall-clock assertion would flake. Wait until the fake fetch
+  // has actually begun, then advance the mocked timer.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const home = await fixture(t);await saveUsageSetting(home, true);
-  let aborted = false;let requests = 0;
-  const reporter = createUsageReporter(home, { version, timeoutMs: 15, fetchImpl: async (_url, init) => {
-    requests++;
-    return new Promise((resolve, reject) => init.signal.addEventListener('abort', () => { aborted = true;reject(new Error('aborted')); }, { once: true }));
+  let aborted = false;let requests = 0;let started;
+  const startedPromise = new Promise(resolve => { started = resolve; });
+  const reporter = createUsageReporter(home, { version: async () => '0.1.0', timeoutMs: 15, fetchImpl: async (_url, init) => {
+    requests++;started();
+    return new Promise((resolve, reject) => {
+      if (init.signal.aborted) { aborted = true;reject(new Error('aborted'));return; }
+      init.signal.addEventListener('abort', () => { aborted = true;reject(new Error('aborted')); }, { once: true });
+    });
   } });
-  await Promise.all([reporter.activity(), delay(40)]);
-  assert.equal(aborted, true);reporter.close();await reporter.activity();
+  t.after(() => reporter.close());
+  const pending = reporter.activity();
+  await startedPromise;
+  t.mock.timers.tick(15);
+  await pending;
+  assert.equal(aborted, true);
   assert.equal(requests, 1);
+  reporter.close();
+  await reporter.activity();
+  assert.equal(requests, 1, 'close prevents later requests');
 });
 
 test('corrupt consent or installation state fails closed instead of generating a new identity', async t => {

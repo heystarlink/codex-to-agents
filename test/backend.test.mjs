@@ -8,6 +8,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ensureBackend, stopBackend, backendAuth, backendStatus } from '../src/backend-control.mjs';
 import { lazyHermes } from '../src/hermes-loader.mjs';
+import { lazyQoder } from '../src/qoder-loader.mjs';
 import { OrderBook } from '../src/orders.mjs';
 
 async function fixture(t) {
@@ -39,8 +40,10 @@ test('concurrent startup and HTTP clients share one backend; connection close an
     const snapshot = () => panel.callTool({ name: 'panel_snapshot', arguments: {} }).then(value => value.structuredContent);
     assert.equal((await snapshot()).service.pid, started[0].pid);
     assert.equal((await snapshot()).service.hermes_loaded, false);
+    assert.equal((await snapshot()).service.qoder_loaded, false);
     await panel.callTool({ name: 'panel_snapshot', arguments: { executor: 'dsh', refresh_models: true } });
     assert.equal((await backendStatus(home)).hermes_loaded, false);
+    assert.equal((await backendStatus(home)).qoder_loaded, false);
     await panel.callTool({ name: 'panel_settings', arguments: { enabled: false, executor: 'dsh' } });
     assert.equal((await snapshot()).delegation.executor, 'dsh');
     await a.close();
@@ -83,6 +86,31 @@ test('Hermes loads only for unfinished Hermes work, while completed and DSH work
     assert.equal(loader.state.loaded, true);assert.equal(started, 1);
   } finally { await loader.close(); }
   assert.equal(closed, 1);
+});
+
+test('Qoder loads only for configured, unfinished Qoder work and stays unloaded otherwise', async t => {
+  const home = await fixture(t);const book = new OrderBook(home);await book.open();
+  let started = 0;let closed = 0;
+  const loader = lazyQoder(home, { load: async () => ({ startExecutorWorker: () => { started++;return { async close() { closed++; } }; } }) });
+  try {
+    await loader.check();assert.equal(loader.state.loaded, false);assert.equal(started, 0);
+    const unconfigured = await book.submit('work_submit', { executor: 'qoder', goal: 'no configuration' });
+    await loader.check();assert.equal(started, 0, 'no settings means no worker');
+    await book.transition(unconfigured.order_id, 'completed');
+    await writeFile(join(home, 'settings.json'), JSON.stringify({ qoder: { executable: '/opt/qodercli' } }));
+    // Only a completed order must not wake the worker.
+    const finished = await book.submit('work_submit', { executor: 'qoder', goal: 'finished qoder work' });
+    await book.transition(finished.order_id, 'completed');
+    await loader.check();assert.equal(started, 0);
+    await book.submit('work_submit', { executor: 'qoder', goal: 'new qoder work' });
+    await loader.check();await loader.check();
+    assert.equal(loader.state.loaded, true);assert.equal(started, 1);
+    // A reconnect request starts it even before the first order exists.
+    await writeFile(join(home, 'settings.json'), JSON.stringify({ qoder: { executable: '/opt/other' } }));
+    await loader.check({ force: true });
+    assert.equal(started, 2);assert.equal(closed, 1, 'a settings change replaces the worker');
+  } finally { await loader.close(); }
+  assert.equal(closed, started);
 });
 
 test('a runtime query can initialize Hermes before the first order; settings changes replace or stop the consumer', async t => {

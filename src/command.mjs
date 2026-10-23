@@ -88,8 +88,22 @@ async function hermesSettings(options) {
     ...(providers ? { providers } : {}), ...(options['hermes-token-env'] ? { tokenEnv: options['hermes-token-env'] } : {}) };
 }
 
+// The Qoder executable is verified before anything is saved. An explicitly
+// configured path is never replaced by a discovered one; without a path the
+// official local locations and PATH are searched in order.
+export async function qoderSettings(options) {
+  const { resolveExecutable } = await import('./qoder-cli.mjs');
+  const resolved = await resolveExecutable({ executable: options['qoder-executable'] });
+  return {
+    executable: resolved.executable, version: resolved.version,
+    defaultDirectory: resolve(options.directory ?? join(options.home, 'workspace')),
+  };
+}
+
 export async function prepareDshExtension() {
-  const names = ['extension.mjs', 'desktop.mjs', 'worker.mjs', 'orders.mjs'];
+  // A self-contained copy: every relative import of these modules must resolve
+  // inside this directory (executors.mjs is imported by worker/orders).
+  const names = ['extension.mjs', 'desktop.mjs', 'worker.mjs', 'orders.mjs', 'executors.mjs'];
   const sources = await Promise.all(names.map(name => readFile(new URL(name, import.meta.url))));
   const hash = createHash('sha256');
   sources.forEach((source, index) => { hash.update(names[index]);hash.update(source); });
@@ -99,12 +113,29 @@ export async function prepareDshExtension() {
   return join(directory, 'extension.mjs');
 }
 
-export async function install(options) {
+export async function install(options, { register = registerMcp } = {}) {
   const { OrderBook } = await import('./orders.mjs');
+  const { isExecutor, EXECUTORS } = await import('./executors.mjs');
   const home = resolve(options.home);
   const book = new OrderBook(home);await book.open();
   const previous = await readSettings(home);
-  if (options.executor && !['dsh', 'hermes'].includes(options.executor)) throw new Error('executor must be dsh or hermes.');
+  if (options.executor && !isExecutor(options.executor)) throw new Error(`executor must be one of ${EXECUTORS.join(', ')}.`);
+  if (options.executor === 'qoder') {
+    const saved = await backup(home, { 'codex.toml': join(homedir(), '.codex/config.toml'), 'settings.json': join(home, 'settings.json') });
+    const settings = { ...previous };
+    if (options.action === 'disable') delete settings.qoder;
+    else {
+      settings.qoder = await qoderSettings({ ...options, home });
+      await mkdir(settings.qoder.defaultDirectory, { recursive: true });
+      await register(home, options.codex);
+    }
+    await book.atomic(join(home, 'settings.json'), settings);
+    const dsh = await book.runtime();
+    return { executor: 'qoder', configured: options.action !== 'disable', backup: saved,
+      ...(settings.qoder ? { executable: settings.qoder.executable, version: settings.qoder.version } : {}),
+      mcp: 'codex-to-agents', restart_mcp_required: true, login_required: options.action !== 'disable',
+      dsh_reload_required: Boolean(dsh.snapshot?.active && dsh.snapshot.protocol !== 2), order_history_retained: true };
+  }
   if (options.executor === 'hermes') {
     const saved = await backup(home, { 'codex.toml': join(homedir(), '.codex/config.toml'), 'settings.json': join(home, 'settings.json') });
     const settings = { ...previous };
@@ -112,7 +143,7 @@ export async function install(options) {
     else {
       settings.hermes = await hermesSettings({ ...options, home });
       await mkdir(settings.hermes.defaultDirectory, { recursive: true });
-      await registerMcp(home, options.codex);
+      await register(home, options.codex);
     }
     await book.atomic(join(home, 'settings.json'), settings);
     const dsh = await book.runtime();
@@ -140,7 +171,7 @@ export async function install(options) {
   // imports when Cordis reloads the plugin in an already-running desktop.
   const module = await prepareDshExtension();
   const next = stripExtension(original).trimEnd() + '\n\n' + extensionBlock(settings, module);
-  await registerMcp(home, options.codex);
+  await register(home, options.codex);
   await writeFile(join(home, 'settings.json'), JSON.stringify(settings, null, 2), { mode: 0o600 });
   await writeFile(profile, next);
   return { configured: true, profile, home, mcp: 'codex-to-agents', backup: saved };
@@ -151,6 +182,7 @@ export async function main(args = process.argv.slice(2)) {
     home: { type: 'string', default: join(homedir(), '.codex-to-agents') }, provider: { type: 'string' },
     directory: { type: 'string' }, profile: { type: 'string' }, 'dsh-home': { type: 'string' }, codex: { type: 'string' },
     executor: { type: 'string' }, 'hermes-url': { type: 'string' }, 'hermes-token-env': { type: 'string' },
+    'qoder-executable': { type: 'string' },
     web: { type: 'boolean' }, once: { type: 'boolean' }, json: { type: 'boolean' }, 'panel-only': { type: 'boolean' },
     interval: { type: 'string', default: '1000' }, limit: { type: 'string', default: '30' }, port: { type: 'string', default: '18862' },
   } });
@@ -195,14 +227,24 @@ export async function main(args = process.argv.slice(2)) {
     console.log(JSON.stringify({ installed: true, ...plugin, backup: saved, restart_codex_required: true,
       hook_trust_required: true, automatic_delegation: 'unchanged; off when not configured' }, null, 2));
   } else if (command === 'worker') {
-    const { startHermesWorker } = await import('./hermes-worker.mjs');
-    if (values.executor && values.executor !== 'hermes') throw new Error('Standalone worker supports --executor hermes; DSH uses its desktop plugin.');
-    const home = resolve(values.home);
-    const settings = await readSettings(home);
-    const worker = startHermesWorker(home, values['hermes-url'] ? await hermesSettings({ ...values, home })
-      : settings.hermes ?? await hermesSettings({ ...values, home }), { onError: error => console.error(error.message) });
-    console.log('Hermes worker started. Ctrl+C to stop; native tasks are retained.');
-    for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { await worker.close();process.exit(0); });
+    if (values.executor === 'qoder') {
+      const { startQoderWorker } = await import('./qoder-worker.mjs');
+      const home = resolve(values.home);
+      const settings = (await readSettings(home)).qoder;
+      if (!settings) throw new Error('Qoder is not configured. Run enable --executor qoder first.');
+      const worker = startQoderWorker(home, settings, { onError: error => console.error(error.message) });
+      console.log('Qoder worker started. Ctrl+C to stop; native sessions are retained.');
+      for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { await worker.close();process.exit(0); });
+    } else {
+      const { startHermesWorker } = await import('./hermes-worker.mjs');
+      if (values.executor && values.executor !== 'hermes') throw new Error('Standalone worker supports --executor hermes or qoder; DSH uses its desktop plugin.');
+      const home = resolve(values.home);
+      const settings = await readSettings(home);
+      const worker = startHermesWorker(home, values['hermes-url'] ? await hermesSettings({ ...values, home })
+        : settings.hermes ?? await hermesSettings({ ...values, home }), { onError: error => console.error(error.message) });
+      console.log('Hermes worker started. Ctrl+C to stop; native tasks are retained.');
+      for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, async () => { await worker.close();process.exit(0); });
+    }
   } else if (['enable', 'disable'].includes(command)) {
     console.log(JSON.stringify(await install({ ...values, dshHome: values['dsh-home'], action: command }), null, 2));
   } else if (command === 'monitor') {
@@ -223,7 +265,7 @@ export async function main(args = process.argv.slice(2)) {
     const { OrderBook } = await import('./orders.mjs');
     const book = new OrderBook(resolve(values.home));await book.open();
     console.log(JSON.stringify({ ...await book.runtimes(), orders: (await book.list()).length }, null, 2));
-  } else console.log('Commands: serve | plugin-install | backend start|stop|restart|status | enable --provider PROVIDER | enable --executor hermes | disable [--executor hermes] | worker --executor hermes | status | monitor\nHermes: --hermes-url http://127.0.0.1:9120 --hermes-token-env VARIABLE\nMonitor: --web --port 18862 | --once | --json | --interval 1000 --limit 30\nOptions: --home DIR --directory DIR --profile desktop --dsh-home DIR --codex EXECUTABLE');
+  } else console.log('Commands: serve | plugin-install | backend start|stop|restart|status | enable --provider PROVIDER | enable --executor hermes | enable --executor qoder | disable [--executor hermes|qoder] | worker --executor hermes|qoder | status | monitor\nHermes: --hermes-url http://127.0.0.1:9120 --hermes-token-env VARIABLE\nQoder: enable --executor qoder [--qoder-executable /absolute/path/to/qodercli] [--directory DIR]\nMonitor: --web --port 18862 | --once | --json | --interval 1000 --limit 30\nOptions: --home DIR --directory DIR --profile desktop --dsh-home DIR --codex EXECUTABLE');
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === entry) {

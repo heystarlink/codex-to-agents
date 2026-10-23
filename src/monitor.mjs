@@ -2,6 +2,7 @@ import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { emitKeypressEvents } from 'node:readline';
 import { OrderBook } from './orders.mjs';
+import { EXECUTORS } from './executors.mjs';
 import { readDelegation } from './delegation.mjs';
 import { usageStatus } from './usage.mjs';
 
@@ -33,7 +34,7 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now() } = {
   try { delegation = await readDelegation(home); }
   catch { delegation = { enabled: false, executor: 'hermes', error: '自动派工设置读取失败，请重新保存开关。' };warnings.push(delegation.error); }
   const executors = {};
-  for (const name of ['dsh', 'hermes']) {
+  for (const name of EXECUTORS) {
     let runtime = { online: false, snapshot: null };
     try { runtime = await book.runtime(null, name); }
     catch (error) { warnings.push(`${name} 运行快照读取失败：${error.message}`); }

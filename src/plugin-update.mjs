@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { OrderBook } from './orders.mjs';
+import { EXECUTORS } from './executors.mjs';
 import { autoUpdateSetting } from './update-reminder.mjs';
 
 // Board-only update backend. The board never lets a client supply a repository
@@ -36,6 +37,7 @@ const workerEntry = fileURLToPath(new URL('./plugin-update-worker.mjs', import.m
 const CARRIED = ['status', 'current', 'latest', 'branch', 'message', 'reason', 'stage', 'pending_install',
   'restart_required', 'codex_reload_required', 'dsh_reload_required', 'backend_restarted',
   'backend_reload_required', 'dependencies_installed', 'plugin_regenerated', 'running_tasks',
+  'running_orders', 'running_sessions',
   'checked_at', 'updated_at', 'finished_at', 'recovery', 'install_error'];
 
 const nowIso = () => new Date().toISOString();
@@ -546,7 +548,9 @@ async function runningWork(home) {
   }
   const activeOrders = orders.filter(order => RUNNING_ORDERS.has(order.status));
   const sessions = [];
-  for (const executor of ['dsh', 'hermes']) {
+  // Idle checks must cover every execution end, including Qoder sessions, so an
+  // update can never replace code under a running task.
+  for (const executor of EXECUTORS) {
     let runtime;
     try { runtime = await book.runtime(null, executor); }
     catch (error) { return { count: null, error: clean(error.message) }; }

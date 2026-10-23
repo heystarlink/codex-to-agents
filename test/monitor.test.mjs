@@ -82,6 +82,24 @@ test('monitor separates identical session IDs and freshness across DSH and Herme
   assert.equal(view.orders.find(order => order.executor === 'hermes').stale, false);
 });
 
+test('Qoder is a first-class executor in the monitor, including catalog diagnostics', async t => {
+  const { book, home } = await fixture(t);
+  const qoder = await book.submit('work_submit', { executor: 'qoder', goal: 'Qoder work', model: 'Auto' });
+  await book.transition(qoder.order_id, 'executing', { conversation_id: 'qoder-session' });
+  const now = Date.now();
+  await book.runtime({ active: true, at: new Date(now).toISOString(), catalog: { models: [{ provider: 'qoder', model: 'Auto', name: 'Auto', efforts: [] }], error: 'Qoder CLI 未登录：请先登录。' }, sessions: [{ id: 'qoder-session', status: 'running' }] }, 'qoder');
+  const view = await monitorSnapshot(home, { now });
+  assert.equal(view.worker.online, true);
+  assert.equal(view.worker.executors.qoder.online, true);
+  assert.deepEqual(view.worker.executors.qoder.models.map(model => model.model), ['Auto']);
+  assert.match(view.worker.executors.qoder.catalog_error, /未登录/);
+  assert.equal(view.agents.find(agent => agent.executor === 'qoder').status, 'running');
+  assert.equal(view.orders.find(order => order.order_id === qoder.order_id).stale, false);
+  const stale = await monitorSnapshot(home, { now: now + 7000 });
+  assert.equal(stale.worker.executors.qoder.online, false);
+  assert.equal(stale.agents.find(agent => agent.executor === 'qoder').status, 'unknown');
+});
+
 test('model catalogs stay scoped to each executor, including catalog failures', async t => {
   const { book, home } = await fixture(t);
   const models = [{ provider: 'account', model: 'flash', name: 'Flash' }];
