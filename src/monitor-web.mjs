@@ -1,18 +1,17 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { monitorSnapshot } from './monitor.mjs';
-import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
+import { settingsSnapshot } from './settings-snapshot.mjs';
 
-export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
+// This page is only the shared settings surface. It deliberately keeps no
+// work-order index: every refresh reads delegation, usage and heartbeats, so a
+// large or damaged history cannot slow it down or leak into the response.
+export async function monitorWeb(home, { port = 18862 } = {}) {
   const [html, client, sdd] = await Promise.all([
     readFile(new URL('./monitor.html', import.meta.url)),
     readFile(new URL('./monitor-client.js', import.meta.url)),
     readFile(new URL('./sdd-client.js', import.meta.url)),
   ]);
   let address;
-  // The dashboard is long-lived: one metadata index per home keeps each
-  // refresh from reparsing the whole history.
-  const index = await acquireOrderIndex(home);
   const server = createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -31,7 +30,7 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
       else if (path === '/monitor-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(client);
       else if (path === '/sdd-client.js') res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(sdd);
       else if (path === '/api/snapshot') {
-        const snapshot = await monitorSnapshot(home, { limit, index });
+        const snapshot = await settingsSnapshot(home);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }).end(JSON.stringify(snapshot));
       } else res.writeHead(404).end('Not found.');
     } catch (error) {
@@ -40,26 +39,17 @@ export async function monitorWeb(home, { port = 18862, limit = 50 } = {}) {
     }
   });
   server.requestTimeout = 10000;server.headersTimeout = 5000;
-  try {
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => { server.off('error', reject);resolve(); });
-    });
-  } catch (error) {
-    await releaseOrderIndex(index);
-    throw error;
-  }
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => { server.off('error', reject);resolve(); });
+  });
   address = server.address();
   return {
     url: `http://127.0.0.1:${address.port}`,
     async close() {
-      try {
-        await new Promise((resolve, reject) => {
-          server.close(error => error ? reject(error) : resolve());server.closeIdleConnections();
-        });
-      } finally {
-        await releaseOrderIndex(index);
-      }
+      await new Promise((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());server.closeIdleConnections();
+      });
     },
   };
 }

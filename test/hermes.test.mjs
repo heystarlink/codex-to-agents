@@ -253,6 +253,40 @@ test('offline Hermes leaves orders queued and native conversation management pre
   const files = await readdir(f.home);assert.ok(files.includes('runtime-hermes.json'));
 });
 
+test('completed receipts are released and a warm restart keeps only the permission locator', async t => {
+  const f = await fixture(t);
+  await setHermesBoard(f.home, { hermes_permission: 'yolo' });
+  const parent = await f.book.submit('work_submit', { executor: 'hermes', goal: 'restart permission' });
+  const first = await f.worker();await first.consumer.tick();
+  const started = await f.book.inspect(parent.order_id);
+  f.native.complete(started.conversation_id, 'FIRST');await first.consumer.tick();
+  await first.adapter.writes;
+  assert.equal((await f.book.inspect(parent.order_id)).status, 'completed');
+  assert.equal(first.adapter.turns.size, 0, 'a completed result is not retained in turns');
+  assert.equal(first.adapter.byLive.size, 0);
+  await first.consumer.close();
+
+  const sets = f.native.calls.filter(call => call.method === 'config.set').length;
+  await setHermesBoard(f.home, {});
+  const second = await f.worker();
+  assert.equal(second.adapter.store.stats.receiptReads, 0, 'completed bodies are not read on restart');
+  assert.equal(second.adapter.turns.size, 0);
+  const location = await second.adapter.checkpoint(started.conversation_id);
+  assert.equal(location.conversation_id, started.conversation_id);
+  assert.deepEqual(location.permission, { preset: 'yolo', scope: 'session', readback: 'session.info', effective_yolo: true });
+  assert.equal(second.adapter.store.stats.receiptReads, 0, 'the stored permission comes from the locator index');
+
+  const follow = await f.book.submit('work_update', { target_order: parent.order_id, action: 'append', message: 'again' });
+  await second.consumer.tick();
+  f.native.complete(started.conversation_id, 'SECOND');await second.consumer.tick();
+  const done = await f.book.inspect(follow.order_id);
+  assert.equal(done.status, 'completed');
+  assert.equal(f.native.calls.filter(call => call.method === 'config.set').length, sets,
+    'a follow-up after restart must not rewrite the native permission');
+  assert.deepEqual(done.output.permission, { preset: 'yolo', scope: 'session', readback: 'session.info', effective_yolo: true });
+  assert.equal(second.adapter.turns.size, 0);
+});
+
 test('follow-ups resolve the canonical custom provider from native metadata instead of rejecting the runtime alias', async t => {
   const f = await fixture(t);
   f.settings.providers = ['custom:example'];

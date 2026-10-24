@@ -88,9 +88,15 @@ export class Consumer {
     return this.tail;
   }
 
-  relevantChange() {
+  // Immediate wake-ups are reserved for a changed status of THIS executor:
+  // new or queued work, a terminal state that can release a blocked follow-up,
+  // or a target conversation becoming available. Another executor's orders and
+  // a running order whose native progress text merely changes (same status)
+  // must not re-arm the scheduler: the active interval already follows work.
+  relevantChange(event) {
     if (this.closed || !this.index) return false;
-    return this.index.pending(this.executor).length > 0;
+    return Boolean(event?.changes?.some(change =>
+      change.executor === this.executor && change.status !== change.previous));
   }
 
   start({ activeInterval = this.activeInterval, idleInterval = this.idleInterval, heartbeatInterval = this.heartbeatInterval } = {}) {
@@ -98,8 +104,8 @@ export class Consumer {
     this.activeInterval = activeInterval;
     this.idleInterval = idleInterval;
     this.scheduler = { timer: null, running: false, again: false };
-    this.unsubscribe = this.index.onChange(() => {
-      if (this.relevantChange()) this.wake();
+    this.unsubscribe = this.index.onChange(event => {
+      if (this.relevantChange(event)) this.wake();
     });
     // Liveness is published independently of delivery, catalog probing and
     // native observation, so a slow adapter can never look offline.

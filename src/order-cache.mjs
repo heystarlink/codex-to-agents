@@ -153,6 +153,19 @@ export class OrderIndex {
     return () => this.listeners.delete(listener);
   }
 
+  // Progress text and output are not part of the metadata projection, so an
+  // executing order's streamed progress only changes `updated_at`. Listeners
+  // that schedule work need the owning executor plus each changed id's status
+  // and the status it replaced, so they can wake only for their own real
+  // transitions instead of every metadata rewrite.
+  emit(changes) {
+    if (!changes?.size) return;
+    const event = { ids: [...changes.keys()], changes: [...changes.values()] };
+    for (const listener of [...this.listeners]) {
+      try { listener(event); } catch { /* a dead listener must not stop the index */ }
+    }
+  }
+
   all() {
     return [...this.entries.values()].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.order_id.localeCompare(b.order_id));
   }
@@ -188,14 +201,18 @@ export class OrderIndex {
   async runSync() {
     const epoch = this.localEpoch;
     const ids = await listIds(this.requests);
-    const changed = new Set();
+    const changed = new Map();
     const present = new Set(ids);
     // A same-process change may have inserted an entry after this pass took
     // its directory snapshot. Deleting entries from that older snapshot would
     // hide live work until the next pass, so skip pruning when that raced.
     if (this.localEpoch === epoch) {
       for (const id of [...this.entries.keys()]) {
-        if (!present.has(id)) { this.entries.delete(id); this.versions.delete(id); changed.add(id); }
+        if (!present.has(id)) {
+          const previous = this.entries.get(id);
+          this.entries.delete(id); this.versions.delete(id);
+          changed.set(id, { id, executor: previous?.executor ?? null, status: null, previous: previous?.status ?? null });
+        }
       }
       for (const id of [...this.invalid.keys()]) if (!present.has(id)) { this.invalid.delete(id); this.versions.delete(id); }
     }
@@ -231,12 +248,15 @@ export class OrderIndex {
       const previous = this.entries.get(id);
       this.entries.delete(id);
       this.invalid.set(id, error.message);
-      if (previous) changed.add(id);
+      if (previous) changed.set(id, { id, executor: previous.executor, status: null, previous: previous.status });
       return;
     }
     if (!request) {
       if (stale()) { this.dirty.add(id); return; }
-      this.entries.delete(id);this.invalid.delete(id);changed.add(id);return;
+      const previous = this.entries.get(id);
+      this.entries.delete(id);this.invalid.delete(id);
+      if (previous) changed.set(id, { id, executor: previous.executor, status: null, previous: previous.status });
+      return;
     }
     let state = null;
     try { state = await readJson(join(this.states, `${id}.json`)); }
@@ -245,7 +265,7 @@ export class OrderIndex {
       const previous = this.entries.get(id);
       this.entries.delete(id);
       this.invalid.set(id, error.message);
-      if (previous) changed.add(id);
+      if (previous) changed.set(id, { id, executor: previous.executor, status: null, previous: previous.status });
       return;
     }
     if (stale()) { this.dirty.add(id); return; }
@@ -253,7 +273,7 @@ export class OrderIndex {
     const previous = this.entries.get(id);
     this.entries.set(id, next);
     this.invalid.delete(id);
-    if (!previous || !sameEntry(previous, next)) changed.add(id);
+    if (!previous || !sameEntry(previous, next)) changed.set(id, { id, executor: next.executor, status: next.status, previous: previous?.status ?? null });
   }
 
   localChange(event) {
@@ -262,15 +282,16 @@ export class OrderIndex {
     this.localEpoch++;
     this.versions.set(id, (this.versions.get(id) ?? 0) + 1);
     if (event.remove) {
+      const previous = this.entries.get(id);
       const had = this.entries.delete(id) || this.invalid.delete(id);
-      if (had) this.emit(new Set([id]));
+      if (had) this.emit(new Map([[id, { id, executor: previous?.executor ?? null, status: null, previous: previous?.status ?? null }]]));
     } else if (event.request) {
       const previous = this.entries.get(id);
       if (previous && !event.state) { this.scheduleSync(); return; }
       const next = project(event.request, event.state ?? { status: 'queued' });
       this.entries.set(id, next);
       this.invalid.delete(id);
-      if (!previous || !sameEntry(previous, next)) this.emit(new Set([id]));
+      if (!previous || !sameEntry(previous, next)) this.emit(new Map([[id, { id, executor: next.executor, status: next.status, previous: previous?.status ?? null }]]));
     } else if (event.state) {
       const previous = this.entries.get(id);
       if (!previous) { this.dirty.add(id); }
@@ -285,17 +306,10 @@ export class OrderIndex {
           directory: event.state.directory ?? previous.directory,
         };
         this.entries.set(id, next);
-        if (!sameEntry(previous, next)) this.emit(new Set([id]));
+        if (!sameEntry(previous, next)) this.emit(new Map([[id, { id, executor: next.executor, status: next.status, previous: previous.status }]]));
       }
     } else this.dirty.add(id);
     this.scheduleSync();
-  }
-
-  emit(ids) {
-    if (!ids.size) return;
-    for (const listener of [...this.listeners]) {
-      try { listener({ ids: [...ids] }); } catch { /* a dead listener must not stop the index */ }
-    }
   }
 
   scheduleSync() {

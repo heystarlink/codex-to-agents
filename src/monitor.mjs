@@ -1,8 +1,7 @@
 import { emitKeypressEvents } from 'node:readline';
 import { OrderBook } from './orders.mjs';
-import { EXECUTORS } from './executors.mjs';
 import { acquireOrderIndex, releaseOrderIndex, orderTitle } from './order-cache.mjs';
-import { readDelegation } from './delegation.mjs';
+import { readExecutorRuntimes, settingsView } from './settings-snapshot.mjs';
 import { usageStatus } from './usage.mjs';
 
 export const ACTIVE = new Set(['queued', 'dispatching', 'executing']);
@@ -33,20 +32,8 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now(), inde
   if (!index) index = await acquireOrderIndex(home);
   try {
     const warnings = index.warnings().slice(0, 50);
-    let delegation;
-    try { delegation = await readDelegation(home); }
-    catch { delegation = { enabled: false, executor: 'hermes', error: '自动派工设置读取失败，请重新保存开关。' };warnings.push(delegation.error); }
-    const executors = {};
-    for (const name of EXECUTORS) {
-      let runtime = { online: false, snapshot: null };
-      try { runtime = await book.runtime(null, name); }
-      catch (error) { warnings.push(`${name} 运行快照读取失败：${error.message}`); }
-      runtime.online = Boolean(runtime.snapshot?.active && now - (epoch(runtime.snapshot.at) ?? 0) < 6000);
-      executors[name] = runtime;
-    }
-    const online = Object.values(executors).some(runtime => runtime.online);
-    const latest = Object.values(executors).map(runtime => runtime.snapshot).filter(Boolean)
-      .sort((a, b) => (epoch(b.at) ?? 0) - (epoch(a.at) ?? 0))[0];
+    const { delegation, executors, warnings: settingsWarnings } = await readExecutorRuntimes(home, now);
+    warnings.push(...settingsWarnings);
     // Summaries and agent grouping come from the bounded metadata index. Full
     // request/state bodies are read only for the rows the caller displays.
     const entries = index.all().sort(newestFirst);
@@ -95,22 +82,10 @@ export async function monitorSnapshot(home, { limit = 30, now = Date.now(), inde
       else if (warnings.length < 50) warnings.push(`工作单 ${page[position].order_id.slice(0, 8)} 读取失败：${result.reason.message}`);
     });
     orders.sort(newestFirst);
+    // The settings view is shared with the board/web pages; the monitor adds
+    // the bounded order rows and agent groups only for this explicit read.
     return {
-      generated_at: new Date(now).toISOString(), home, delegation, usage: await usageStatus(home),
-      service: { pid: process.pid, name: process.title, rss_mib: Math.round(process.memoryUsage.rss() / 1024 / 1024) },
-      worker: { online, last_seen: latest?.at ?? null,
-        heartbeat_age_ms: latest ? Math.max(0, now - (epoch(latest.at) ?? 0)) : null,
-        pid: latest?.pid ?? null, live_sessions_available: Object.values(executors).some(runtime => Array.isArray(runtime.snapshot?.sessions)),
-        catalog_error: Object.values(executors).find(runtime => runtime.snapshot?.catalog?.error)?.snapshot.catalog.error ?? null,
-        executors: Object.fromEntries(Object.entries(executors).map(([name, runtime]) => [name, {
-          online: runtime.online, last_seen: runtime.snapshot?.at ?? null,
-          models: runtime.snapshot?.catalog?.models ?? [],
-          // Older consumers omit this heartbeat field entirely. Keeping the raw
-          // value lets the board distinguish "not supported" from "supported but
-          // no preset available" instead of assuming the control exists.
-          permission_control: runtime.snapshot?.catalog?.permission_control ?? null,
-          catalog_error: runtime.snapshot?.catalog?.error ?? null,
-        }])) },
+      ...settingsView({ delegation, executors, now }), home, usage: await usageStatus(home),
       summary, agents: [...grouped.values()], orders, warnings,
     };
   } finally {

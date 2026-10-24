@@ -7,7 +7,8 @@ import { lazyHermes } from './hermes-loader.mjs';
 import { lazyQoder } from './qoder-loader.mjs';
 import { hookHealth } from './hook-health.mjs';
 import { createUsageReporter } from './usage.mjs';
-import { acquireOrderIndex, releaseOrderIndex } from './order-cache.mjs';
+import { settingsSnapshot } from './settings-snapshot.mjs';
+import { createRecentOrderReader } from './recent-orders.mjs';
 
 export async function startBackend(home, { usageOptions } = {}) {
   home = resolve(home);
@@ -26,19 +27,10 @@ export async function startBackend(home, { usageOptions } = {}) {
   }
   const hermesWorker = lazyHermes(home, { onError: error => console.error(error.message) });
   const qoderWorker = lazyQoder(home, { onError: error => console.error(error.message) });
+  const recentOrders = createRecentOrderReader(home);
   const previous = await readJson(join(home, 'backend.json'));
   let address;let closing;
   let cache;let cacheAt = 0;let reading;let readingGeneration;let generation = 0;
-  let orderIndex;
-  const sharedIndex = () => {
-    if (!orderIndex) {
-      const attempt = acquireOrderIndex(home);
-      orderIndex = attempt;
-      // Do not latch a transient open failure: the next snapshot retries.
-      attempt.catch(() => { if (orderIndex === attempt) orderIndex = null; });
-    }
-    return orderIndex;
-  };
   const invalidate = () => { cache = null;cacheAt = 0;generation++; };
   const activation = hookHealth(home, { onChange: invalidate });
   const usage = createUsageReporter(home, usageOptions);
@@ -47,8 +39,8 @@ export async function startBackend(home, { usageOptions } = {}) {
     if (reading && readingGeneration === generation) return reading;
     const startedGeneration = generation;
     const pending = (async () => {
-      const { monitorSnapshot } = await import('./monitor.mjs');
-      const value = await monitorSnapshot(home, { index: await sharedIndex() });
+      // Settings keep no link to work-order history: no index, no order files.
+      const value = await settingsSnapshot(home);
       value.service.hermes_loaded = hermesWorker.state.loaded;
       value.service.qoder_loaded = qoderWorker.state.loaded;
       value.activation = activation.snapshot();
@@ -88,7 +80,7 @@ export async function startBackend(home, { usageOptions } = {}) {
       const [{ createMcp }, { StreamableHTTPServerTransport }] = await Promise.all([
         import('./mcp.mjs'), import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
       ]);
-      const mcp = await createMcp(home, { panelOnly: path === '/board', snapshot, onSettings: invalidate,
+      const mcp = await createMcp(home, { panelOnly: path === '/board', snapshot, recentOrders, onSettings: invalidate,
         onPanel: () => { void usage.activity();return activation.check(); },
         onUsage: enabled => { usage.settingsChanged(enabled);invalidate(); },
         onRuntime: async executor => {
@@ -111,12 +103,8 @@ export async function startBackend(home, { usageOptions } = {}) {
     usage.close();
     await activation.close();
     await Promise.all([hermesWorker.close(), qoderWorker.close()]);
-    if (orderIndex) {
-      const acquired = await orderIndex.catch(() => null);
-      orderIndex = null;
-      if (acquired) await releaseOrderIndex(acquired);
-    }
     await new Promise(resolve => { server.close(resolve);server.closeIdleConnections(); });
+    await recentOrders.close();
     const owner = await readJson(lock);
     if (owner?.instance === instance) await unlink(lock);
   })();
@@ -130,11 +118,7 @@ export async function startBackend(home, { usageOptions } = {}) {
     return { ...value, close, worker: hermesWorker };
   } catch (error) {
     usage.close();await activation.close();await Promise.all([hermesWorker.close(), qoderWorker.close()]);
-    if (orderIndex) {
-      const acquired = await orderIndex.catch(() => null);
-      orderIndex = null;
-      if (acquired) await releaseOrderIndex(acquired);
-    }
+    await recentOrders.close();
     await unlink(lock);throw error;
   }
 }

@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import { monitorSnapshot } from './monitor.mjs';
+import { settingsSnapshot } from './settings-snapshot.mjs';
 import { EXECUTORS } from './executors.mjs';
 import { delegationInputSchema, saveDelegation, readDelegation } from './delegation.mjs';
 import { saveUsageSetting } from './usage.mjs';
@@ -60,7 +60,7 @@ async function buildHtml() {
     .replace('<script defer>', '<script type="module">');
 }
 
-export function registerPanel(server, home, { snapshot = () => monitorSnapshot(home), onSettings, onRuntime, onPanel, onUsage, runUpdate } = {}) {
+export function registerPanel(server, home, { snapshot = () => settingsSnapshot(home), onSettings, onRuntime, onPanel, onUsage, runUpdate } = {}) {
   server.registerResource('agents-board', PANEL_URI, { title: 'Agents 看板', mimeType, _meta: { ui } }, async () => ({
     contents: [{ uri: PANEL_URI, mimeType, text: await panelHtml(), _meta: {
       ui, 'openai/ui': { availableDisplayModes: ['fullscreen'], preferredDisplayMode: 'fullscreen' },

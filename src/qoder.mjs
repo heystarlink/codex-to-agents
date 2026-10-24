@@ -1,8 +1,9 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { OrderBook } from './orders.mjs';
+import { ReceiptStore } from './receipt-store.mjs';
 import {
   listModels, listModelsError, parseModelList, resolveEffort, resolveExecutable, readPermissionModes,
 } from './qoder-cli.mjs';
@@ -47,10 +48,15 @@ export class Qoder {
     this.now = now;
     this.book = new OrderBook(settings.home);
     this.receipts = join(settings.home, 'qoder-receipts');
+    // Only unfinished receipts are held in memory. Completed bodies stay on
+    // disk; the index keeps just the order/session locator needed for restart,
+    // follow-ups and cancellation.
+    this.store = new ReceiptStore(this.receipts, {
+      isTerminal: settled,
+      cacheSize: settings.receiptCacheSize ?? 32,
+    });
     this.turns = new Map();
     this.processes = new Map();
-    this.bySession = new Map();
-    this.sessions = new Map();
     this.writes = Promise.resolve();
     this.writeError = null;
     this.closed = false;
@@ -74,14 +80,8 @@ export class Qoder {
   }
 
   async open() {
-    await mkdir(this.receipts, { recursive: true, mode: 0o700 });
-    const files = await readdir(this.receipts);
-    for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
-      let receipt;
-      try { receipt = JSON.parse(await readFile(join(this.receipts, file), 'utf8')); }
-      catch { continue; }
+    for (const receipt of await this.store.open()) {
       this.turns.set(receipt.order_id, receipt);
-      if (receipt.conversation_id) this.sessions.set(receipt.conversation_id, receipt);
       if (!settled(receipt.status) && receipt.status !== 'uncertain') {
         // The previous consumer is gone together with its child processes. No
         // native transcript is read here and nothing is replayed: the honest
@@ -193,7 +193,7 @@ export class Qoder {
   observe(ids) {
     return [...new Set(ids)].map(id => {
       const live = this.liveRecordForSession(id);
-      return { id, status: live ? 'running' : this.sessions.has(id) ? 'idle' : 'unloaded' };
+      return { id, status: live ? 'running' : this.store.hasSession(id) ? 'idle' : 'unloaded' };
     });
   }
 
@@ -207,15 +207,17 @@ export class Qoder {
   // not guess: a conversation created outside these work orders has no verified
   // directory to resume in.
   async checkpoint(sessionId) {
-    const receipt = this.sessions.get(sessionId);
-    if (!receipt) throw Object.assign(new Error('无法定位该 Qoder 会话的工作目录；续聊请使用原任务的 work_update（target_order）。'), { definite: true });
+    // The locator index carries the stored directory, route and permission, so
+    // continuing an old conversation never loads its completed receipt body.
+    const locator = this.store.session(sessionId);
+    if (!locator) throw Object.assign(new Error('无法定位该 Qoder 会话的工作目录；续聊请使用原任务的 work_update（target_order）。'), { definite: true });
     return {
-      conversation_id: sessionId, native_session_id: sessionId,
-      directory: receipt.directory, route: receipt.route ?? { provider: PROVIDER, model: null },
+      conversation_id: sessionId, native_session_id: locator.native_session_id ?? sessionId,
+      directory: locator.directory, route: locator.route ?? { provider: PROVIDER, model: null },
       // Follow-ups keep the original task's permission (a stored receipt value,
       // never a fresh read of the board) so a later board change cannot alter an
       // existing conversation.
-      permission: receipt.permission ?? null,
+      permission: locator.permission ?? null,
     };
   }
 
@@ -298,6 +300,7 @@ export class Qoder {
       child = this.spawn(executable, args, { cwd: receipt.directory, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (error) {
       this.fail(record, { message: `Qoder CLI 启动失败：${clean(error.message)}`, kind: 'cli_error' });
+      this.releaseProcess(record);
       throw Object.assign(new Error(`Qoder CLI 启动失败：${clean(error.message)}`), { definite: true });
     }
     record.child = child;
@@ -461,8 +464,6 @@ export class Qoder {
       if (record.timers.startup) { clearTimeout(record.timers.startup);delete record.timers.startup; }
       record.init.resolve(sessionId);
     }
-    this.sessions.set(sessionId, receipt);
-    this.bySession.set(sessionId, receipt.order_id);
     if (!settled(receipt.status) && receipt.status !== 'finishing') receipt.progress = 'Qoder CLI 会话已就绪，正在提交任务…';
     this.persist(receipt);
     // The idle clock only makes sense after init: from here a silent CLI can be
@@ -501,7 +502,6 @@ export class Qoder {
       delivery_uncertain: delivered,
     };
     receipt.updated_at = new Date().toISOString();
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     this.persist(receipt);
     const failure = Object.assign(new Error(message), {
       ...(delivered ? { deliveryUnknown: true } : { definite: true }),
@@ -611,7 +611,6 @@ export class Qoder {
       receipt.progress = receipt.progress || receipt.output?.text || 'Qoder CLI 已完成任务。';
       receipt.output = { ...receipt.output, exit_code: 0, exit_confirmed: true };
       receipt.updated_at = new Date().toISOString();
-      if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
       this.persist(receipt);
       return;
     }
@@ -623,7 +622,6 @@ export class Qoder {
       exit_code: code ?? null, signal: signal ?? null,
     };
     receipt.updated_at = new Date().toISOString();
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     this.persist(receipt);
   }
 
@@ -646,7 +644,6 @@ export class Qoder {
       ...(record.stderr.trim() ? { stderr: clean(record.stderr, 800) } : {}),
     };
     receipt.updated_at = new Date().toISOString();
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     this.persist(receipt);
     const failure = Object.assign(new Error(message), { definite: true, output: structuredClone(receipt.output) });
     record.init.reject(failure);
@@ -662,6 +659,11 @@ export class Qoder {
     record.exited = true;
     this.flushStdout(record);
     record.exit.resolve({ code, signal });
+    try { this.settleExit(record, code, signal); }
+    finally { this.releaseProcess(record); }
+  }
+
+  settleExit(record, code, signal) {
     const receipt = record.receipt;
     if (record.aborted) {
       // The adapter already decided the terminal state (for example a
@@ -671,7 +673,6 @@ export class Qoder {
         if (name === 'cancelGrace') continue;
         clearTimeout(timer);delete record.timers[name];
       }
-      if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
       return;
     }
     for (const [name, timer] of Object.entries(record.timers)) {
@@ -685,10 +686,7 @@ export class Qoder {
     // A consumer shutdown deliberately parked this receipt as uncertain before
     // terminating the child; the resulting SIGTERM must not turn that into a
     // fabricated task failure.
-    if (receipt.status === 'uncertain') {
-      if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
-      return;
-    }
+    if (receipt.status === 'uncertain') return;
     if (!settled(receipt.status)) {
       if (code === 0) {
         this.fail(record, {
@@ -716,7 +714,22 @@ export class Qoder {
         });
       }
     }
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
+  }
+
+  // An exited child must not stay in the process map (nor keep its stream text
+  // alive). A terminal receipt moves to the bounded body cache; the durable
+  // JSON file remains the source of truth.
+  releaseProcess(record) {
+    if (this.processes.get(record.receipt.order_id) === record) this.processes.delete(record.receipt.order_id);
+    if (!record.child || record.exited) {
+      for (const timer of Object.values(record.timers)) clearTimeout(timer);
+      record.timers = {};
+    }
+    const receipt = record.receipt;
+    if (settled(receipt.status) || receipt.status === 'uncertain') {
+      if (this.turns.get(receipt.order_id) === receipt) this.turns.delete(receipt.order_id);
+      this.store.remember(receipt);
+    }
   }
 
   stderrHint(record) {
@@ -732,7 +745,6 @@ export class Qoder {
     receipt.output = { cancellation_requested: true, native_status: 'interrupted', conversation_id: receipt.conversation_id ?? null };
     for (const timer of Object.values(record.timers)) clearTimeout(timer);
     record.timers = {};
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     this.persist(receipt);
   }
 
@@ -750,12 +762,23 @@ export class Qoder {
     if (mode === 'steer') {
       throw Object.assign(new Error('Qoder CLI 不支持在运行中转向（steer）；请等当前回合结束后用 append 续写同一会话。'), { definite: true });
     }
+    // A fast CLI may have queued its terminal save before Worker calls send().
+    // Flush prior writes so a stale "starting" snapshot cannot be mistaken for
+    // the current outcome (or cause a duplicate dispatch).
+    await this.writes;
     let record = this.processes.get(order.id);
-    if (record) {
-      // A fast CLI may have already produced a terminal result (or exited) by
-      // the time Worker calls send(). Never overwrite that state with
-      // "executing" and never report it as a missing session.
-      const current = record.receipt;
+    let current = record?.receipt ?? this.turns.get(order.id);
+    if (!current && this.store.hasOrder(order.id)) {
+      current = await this.store.get(order.id);
+      // A known order whose body vanished cannot be proven unsent; never turn
+      // that into a fresh follow-up/duplicate dispatch.
+      if (!current) throw Object.assign(new Error('Qoder 运行记录缺失，无法确认该任务是否已派发；不会自动重放。'), { deliveryUnknown: true });
+    }
+    if (current) {
+      // A fast CLI may have already produced a terminal result (and released
+      // its process record) by the time Worker calls send(). The receipt for
+      // this exact order decides the outcome; it is never mistaken for a new
+      // follow-up and therefore never replayed.
       if (current.status === 'completed') return this.executionReceipt(current);
       if (current.status === 'uncertain') {
         throw Object.assign(new Error(current.error ?? 'Qoder CLI 权限或会话状态未确认，未再提交消息。'), {
@@ -763,7 +786,7 @@ export class Qoder {
         });
       }
       if (settled(current.status)) throw Object.assign(new Error(current.error ?? 'Qoder CLI 进程已退出，消息未提交。'), { definite: true });
-      if (record.exited) throw Object.assign(new Error('Qoder CLI 进程已退出，消息未提交。'), { definite: true });
+      if (!record || record.exited) throw Object.assign(new Error('Qoder CLI 进程已退出，消息未提交。'), { definite: true });
     } else {
       // Follow-up work resumes from the stored native session instead of
       // creating a new conversation. The directory and route come from this
@@ -832,7 +855,7 @@ export class Qoder {
   async progress(order, state) {
     await this.writes;
     if (this.writeError) throw this.writeError;
-    const receipt = this.turns.get(order.id);
+    const receipt = this.turns.get(order.id) ?? await this.store.get(order.id);
     if (!receipt) return { status: state.status === 'uncertain' ? 'uncertain' : 'executing', progress: '未找到该任务的 Qoder 运行记录。' };
     if (receipt.status === 'completed') return { status: 'completed', progress: receipt.progress, output: receipt.output };
     if (receipt.status === 'failed') return { status: 'failed', progress: receipt.progress, output: receipt.output, error: receipt.error ?? receipt.progress };
@@ -851,22 +874,25 @@ export class Qoder {
     receipt.status = 'uncertain';
     receipt.progress = 'Qoder CLI 进程已退出且没有合法终态；结果无法确认，不会自动重放。';
     receipt.output = { text: receipt.text.slice(-MAX_TEXT), native_status: 'uncertain', terminal_confirmed: false, conversation_id: receipt.conversation_id ?? null };
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     await this.save(receipt);
     return { status: 'uncertain', progress: receipt.progress, output: receipt.output };
   }
 
   async cancel(sessionId) {
     const live = this.liveRecordForSession(sessionId);
-    const orderId = live?.receipt.order_id
-      ?? this.bySession.get(sessionId)
+    const locator = this.store.session(sessionId);
+    const orderId = live?.receipt.order_id ?? locator?.order_id
       ?? [...this.turns.values()].find(receipt => receipt.conversation_id === sessionId)?.order_id;
     const record = live ?? this.processes.get(orderId);
-    const receipt = this.turns.get(orderId);
-    if (receipt?.status === 'finishing') {
+    const receipt = live?.receipt ?? record?.receipt ?? this.turns.get(orderId);
+    // The session locator freezes the status seen when that alias was last
+    // written; a follow-up may have completed after changing native session.
+    // The order's indexed status is the current truth for cancellation.
+    const status = receipt?.status ?? this.store.order(orderId)?.status ?? locator?.status;
+    if (status === 'finishing') {
       return { cancelled: false, already_finishing: true, conversation_id: sessionId, native_queue_cleared: false };
     }
-    if (receipt && settled(receipt.status)) {
+    if (status && settled(status)) {
       return { cancelled: false, already_terminal: true, conversation_id: sessionId, native_queue_cleared: false };
     }
     if (!record || record.exited || !record.child) {
@@ -879,7 +905,6 @@ export class Qoder {
       if (name === 'cancelGrace') continue;
       clearTimeout(timer);delete record.timers[name];
     }
-    if (receipt.conversation_id) this.bySession.delete(receipt.conversation_id);
     await this.save(receipt);
     // Only this order's own child is signalled; other sessions (including the
     // user's own Qoder CLI runs) are never touched, and no process group is
@@ -936,7 +961,10 @@ export class Qoder {
 
   save(receipt) {
     const snapshot = structuredClone(receipt);
-    this.writes = this.writes.then(() => this.book.atomic(join(this.receipts, `${receipt.order_id}.json`), snapshot))
+    // The store writes the receipt body first and the index second; a failed
+    // index write is recoverable from the body on the next start, while a
+    // failed body write is reported to the caller instead of pretending success.
+    this.writes = this.writes.then(() => this.store.commit(snapshot))
       .catch(error => { this.writeError = error; });
     return this.writes.then(() => { if (this.writeError) throw this.writeError; });
   }
@@ -970,5 +998,8 @@ export class Qoder {
     // restart cannot inherit a running CLI from a closed consumer.
     await Promise.all(live.map(record => this.terminate(record)));
     await this.writes;
+    this.turns.clear();
+    this.processes.clear();
+    this.store.close();
   }
 }

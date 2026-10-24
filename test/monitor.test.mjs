@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, access, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, access, readFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { request } from 'node:http';
 import { OrderBook } from '../src/orders.mjs';
@@ -122,17 +122,31 @@ test('the snapshot passes through native permission control per executor', async
   assert.equal(executors.hermes.permission_control, null);
 });
 
-test('web monitor serves the real snapshot but rejects write requests, traversal and foreign hosts', async t => {
+test('web settings page serves a settings-only snapshot and needs no work-order history', async t => {
   const { home, book } = await fixture(t);
-  await book.submit('work_submit', { goal: '<script>untrusted</script>', title: 'A real row' });
-  const server = await monitorWeb(home, { port: 0 });
+  const marker = 'HTTP-SETTINGS-MARKER';
+  const order = await book.submit('work_submit', { goal: `${marker} goal`, title: `${marker} title` });
+  await writeFile(join(home, 'states', `${order.order_id}.json`), '{broken');
+  // A settings-only server must not acquire or scan the history: this would
+  // fail before it can serve a single page.
+  await chmod(join(home, 'requests'), 0o000);
+  await chmod(join(home, 'states'), 0o000);
+  let server;
   try {
+    server = await monitorWeb(home, { port: 0 });
     const html = await fetch(server.url);assert.equal(html.status, 200);
     assert.ok(html.headers.get('content-security-policy').includes("script-src 'self'"));
     const script = await (await fetch(server.url + '/monitor-client.js')).text();
     assert.ok(script.includes('textContent'));assert.ok(!script.includes('innerHTML'));
-    const snapshot = await (await fetch(server.url + '/api/snapshot')).json();
-    assert.equal(snapshot.summary.total, 1);assert.equal(snapshot.orders[0].title, 'A real row');
+    const allowed = ['delegation', 'generated_at', 'service', 'usage', 'warnings', 'worker'];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(server.url + '/api/snapshot');
+      assert.equal(response.status, 200);
+      const snapshot = await response.json();
+      assert.deepEqual(Object.keys(snapshot).sort(), allowed, 'the shared settings page returns no monitor bodies');
+      assert.ok(!JSON.stringify(snapshot).includes(marker));
+      assert.deepEqual(snapshot.warnings, []);
+    }
     assert.equal((await fetch(server.url + '/api/snapshot', { method: 'POST' })).status, 405);
     assert.equal((await fetch(server.url + '/../../etc/passwd')).status, 404);
     assert.equal((await fetch(server.url + '/api/snapshot', { headers: { Origin: 'https://example.org' } })).status, 403);
@@ -141,5 +155,9 @@ test('web monitor serves the real snapshot but rejects write requests, traversal
       req.on('error', reject);req.end();
     });
     assert.equal(status, 403);
-  } finally { await server.close(); }
+  } finally {
+    await chmod(join(home, 'requests'), 0o700);
+    await chmod(join(home, 'states'), 0o700);
+    await server?.close();
+  }
 });

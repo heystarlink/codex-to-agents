@@ -1,12 +1,15 @@
-import { mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HermesClient } from './hermes-client.mjs';
 import { OrderBook } from './orders.mjs';
+import { ReceiptStore } from './receipt-store.mjs';
 import { permissionControl, readExecutorPermission } from './permissions.mjs';
 
 const marker = id => `[codex-to-agents:${id}]`;
 const running = status => ['working', 'waiting', 'starting', 'streaming'].includes(status);
+const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+const terminal = status => TERMINAL.has(status);
 const textOf = message => typeof message.content === 'string' ? message.content
   : Array.isArray(message.content) ? message.content.filter(part => part.type === 'text').map(part => part.text).join('\n') : message.text ?? '';
 
@@ -16,6 +19,12 @@ export class Hermes {
     this.client = client;
     this.book = new OrderBook(settings.home);
     this.receipts = join(settings.home, 'hermes-receipts');
+    // Only unfinished receipts live in turns; completed bodies stay on disk and
+    // the index keeps the session permission needed by a later follow-up.
+    this.store = new ReceiptStore(this.receipts, {
+      isTerminal: terminal,
+      cacheSize: settings.receiptCacheSize ?? 32,
+    });
     this.turns = new Map();
     this.byLive = new Map();
     this.live = new Map();
@@ -24,12 +33,9 @@ export class Hermes {
   }
 
   async open() {
-    await mkdir(this.receipts, { recursive: true, mode: 0o700 });
-    for (const file of await readdir(this.receipts)) {
-      if (!/^[0-9a-f-]{36}\.json$/.test(file)) continue;
-      const receipt = JSON.parse(await readFile(join(this.receipts, file), 'utf8'));
+    for (const receipt of await this.store.open()) {
       this.turns.set(receipt.order_id, receipt);
-      if (!['completed', 'failed', 'cancelled'].includes(receipt.status)) this.byLive.set(receipt.native_session_id, receipt.order_id);
+      if (receipt.native_session_id) this.byLive.set(receipt.native_session_id, receipt.order_id);
     }
   }
 
@@ -179,9 +185,12 @@ export class Hermes {
     // reported as read, not rewritten here (native state and the user's own
     // toggle stay authoritative for an existing conversation).
     const original = [...this.turns.values()].find(receipt => receipt.conversation_id === id);
+    // Old conversations are located through the indexed permission, so their
+    // completed receipt body is not loaded just to continue them.
+    const permission = original ? original.permission ?? null : this.store.session(id)?.permission ?? null;
     return { conversation_id: result.session_key ?? result.resumed ?? id, native_session_id: result.session_id,
       route: { provider, model: result.info?.model },
-      permission: original?.permission ?? null,
+      permission,
       native_yolo: typeof result.info?.yolo === 'boolean' ? result.info.yolo : null };
   }
 
@@ -203,6 +212,7 @@ export class Hermes {
         receipt.output = { text: error.message, native_status: 'rejected', conversation_id: location.conversation_id,
           permission: location.permission ?? null, native_yolo: location.native_yolo ?? null };
         this.byLive.delete(location.native_session_id);await this.save(receipt);
+        this.release(receipt);
       }
       throw error;
     }
@@ -235,11 +245,22 @@ export class Hermes {
       this.byLive.delete(event.session_id);
     } else return;
     this.save(receipt).catch(() => {});
+    if (terminal(receipt.status)) this.release(receipt);
+  }
+
+  // A terminal receipt no longer needs to stay in memory; it remains the fact
+  // on disk and the session locator remains indexed for a later follow-up.
+  release(receipt) {
+    if (this.turns.get(receipt.order_id) === receipt) this.turns.delete(receipt.order_id);
+    if (receipt.native_session_id && this.byLive.get(receipt.native_session_id) === receipt.order_id) {
+      this.byLive.delete(receipt.native_session_id);
+    }
+    this.store.remember(receipt);
   }
 
   save(receipt) {
     const snapshot = structuredClone(receipt);
-    this.writes = this.writes.then(() => this.book.atomic(join(this.receipts, `${receipt.order_id}.json`), snapshot))
+    this.writes = this.writes.then(() => this.store.commit(snapshot))
       .catch(error => { this.writeError = error; });
     return this.writes.then(() => { if (this.writeError) throw this.writeError; });
   }
@@ -247,8 +268,8 @@ export class Hermes {
   async progress(order, state) {
     await this.writes;
     if (this.writeError) throw this.writeError;
-    const receipt = this.turns.get(order.id);
-    if (receipt && ['completed', 'failed', 'cancelled'].includes(receipt.status)) {
+    const receipt = this.turns.get(order.id) ?? await this.store.get(order.id);
+    if (receipt && terminal(receipt.status)) {
       return { status: receipt.status, progress: receipt.progress, output: receipt.output, error: receipt.status === 'failed' ? receipt.output.text : null };
     }
     const session = this.live.get(state.conversation_id);
@@ -295,5 +316,12 @@ export class Hermes {
     return this.client.request('/api/sessions/' + encodeURIComponent(input.conversation_id), { method: 'PATCH', body });
   }
 
-  async close() { await this.writes;this.client.close(); }
+  async close() {
+    await this.writes;
+    this.turns.clear();
+    this.byLive.clear();
+    this.live.clear();
+    this.store.close();
+    this.client.close();
+  }
 }

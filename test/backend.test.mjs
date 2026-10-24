@@ -38,9 +38,15 @@ test('concurrent startup and HTTP clients share one backend; connection close an
     const submitted = await Promise.all([a, b].map(client => client.callTool({ name: 'work_submit', arguments: payload })));
     assert.deepEqual(submitted.map(value => value.structuredContent.reused).sort(), [false, true]);
     const snapshot = () => panel.callTool({ name: 'panel_snapshot', arguments: {} }).then(value => value.structuredContent);
-    assert.equal((await snapshot()).service.pid, started[0].pid);
-    assert.equal((await snapshot()).service.hermes_loaded, false);
-    assert.equal((await snapshot()).service.qoder_loaded, false);
+    // The board snapshot must be settings-only: no work-order rows, groups or
+    // bodies cross this app-only surface even while the saved order exists.
+    const board = await snapshot();
+    assert.equal(board.service.pid, started[0].pid);
+    assert.equal(board.service.hermes_loaded, false);
+    assert.equal(board.service.qoder_loaded, false);
+    assert.deepEqual(Object.keys(board).sort(), ['activation', 'delegation', 'generated_at', 'service', 'usage', 'warnings', 'worker']);
+    assert.ok(!JSON.stringify(board).includes(payload.goal), 'the board snapshot never returns work-order text');
+    assert.deepEqual(board.warnings, []);
     await panel.callTool({ name: 'panel_snapshot', arguments: { executor: 'dsh', refresh_models: true } });
     assert.equal((await backendStatus(home)).hermes_loaded, false);
     assert.equal((await backendStatus(home)).qoder_loaded, false);
@@ -52,7 +58,9 @@ test('concurrent startup and HTTP clients share one backend; connection close an
     await stopBackend(home);const restarted = await ensureBackend(home);
     assert.notEqual(restarted.pid, started[0].pid);assert.equal(restarted.url, address);
     const same = await b.callTool({ name: 'work_submit', arguments: payload });
-    assert.equal(same.structuredContent.reused, true);assert.equal((await snapshot()).summary.total, 1);
+    assert.equal(same.structuredContent.reused, true);
+    assert.equal((await b.callTool({ name: 'work_inspect', arguments: {} })).structuredContent.total, 1,
+      'the model-facing inspection path still lists saved work');
   } finally { await Promise.all(clients.map(client => client.close())); }
 });
 

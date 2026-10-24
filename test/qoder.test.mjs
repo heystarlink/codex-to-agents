@@ -13,6 +13,7 @@ import { monitorSnapshot } from '../src/monitor.mjs';
 import { startBackend } from '../src/backend.mjs';
 import { backendAuth } from '../src/backend-control.mjs';
 import { createQoderFixture } from './fixtures/qoder-cli-fixture.mjs';
+import { ReceiptStore } from '../src/receipt-store.mjs';
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'blocked', 'uncertain']);
 const settled = status => TERMINAL.has(status);
@@ -341,6 +342,43 @@ test('restart keeps a settled order and marks an interrupted receipt uncertain w
   assert.equal((await prints(slow.cli)).length, 1, 'an interrupted dispatch is inspected, not replayed');
 });
 
+test('completed receipts and exited processes are released; a warm restart keeps only the session locator', async t => {
+  const f = await fixture(t, { settings: { receiptCacheSize: 2 } });
+  await setBoard(f.home, { enabled: true, executor: 'qoder', qoder_permission: 'accept_edits' });
+  const order = await submit(f.book, { goal: 'warm restart', directory: f.directory, model: 'DeepSeek-V4-Pro' });
+  const first = await f.worker();
+  const done = await settle(first.consumer, f.book, order.order_id);
+  assert.equal(done.status, 'completed');
+  await waitFor(() => first.adapter.processes.size === 0 && first.adapter.turns.size === 0, { label: 'terminal release' });
+  assert.ok(first.adapter.store.cache.size <= 2, 'the on-demand body cache is bounded');
+  const index = JSON.parse(await readFile(join(f.home, 'qoder-receipts', '.receipt-index.json'), 'utf8'));
+  assert.equal(index.orders[order.order_id].active, false, 'the persisted index marks the receipt terminal');
+  assert.equal(index.sessions[done.conversation_id].permission, 'accept_edits');
+  await first.consumer.close();
+
+  const second = await f.worker();
+  assert.equal(second.adapter.store.stats.receiptReads, 0, 'completed bodies are not read on restart');
+  assert.equal(second.adapter.turns.size, 0);
+  assert.equal(second.adapter.processes.size, 0);
+  const location = await second.adapter.checkpoint(done.conversation_id);
+  assert.equal(location.directory, await realpath(f.directory));
+  assert.equal(location.permission, 'accept_edits');
+  assert.deepEqual(location.route, { provider: 'qoder', model: 'DeepSeek-V4-Pro', effort: null });
+  assert.equal(second.adapter.store.stats.receiptReads, 0, 'checkpoint resolves from the locator index');
+
+  // A later board change must still not alter an existing conversation, even
+  // after the consumer restarted and the full receipt is no longer in memory.
+  await setBoard(f.home, { enabled: true, executor: 'qoder', qoder_permission: 'dont_ask' });
+  const follow = await f.book.submit('work_update', { target_order: order.order_id, action: 'append', message: 'after restart' });
+  const state = await settle(second.consumer, f.book, follow.order_id);
+  assert.equal(state.status, 'completed');
+  const invocation = (await prints(f.cli))[1];
+  assert.equal(invocation.resume, done.conversation_id);
+  assert.equal(invocation.permission_mode, 'accept_edits');
+  assert.equal(state.output.permission_mode, 'acceptEdits');
+  await waitFor(() => second.adapter.processes.size === 0 && second.adapter.turns.size === 0, { label: 'follow-up release' });
+});
+
 test('Qoder rejects workspace and conversation management instead of deleting sessions', async t => {
   const f = await fixture(t);
   const order = await submit(f.book, { goal: 'manage me', directory: f.directory });
@@ -549,4 +587,71 @@ test('an old Qoder CLI without --permission-mode reports unsupported and blocks 
   assert.equal(runtime.snapshot.catalog.permission_control.available, false);
   assert.deepEqual(runtime.snapshot.catalog.permission_control.presets, []);
   assert.match(runtime.snapshot.catalog.permission_control.limitations.join(' '), /未声明 --permission-mode/);
+});
+
+test('cancelling a resumed-from session alias after the follow-up moved to a new native session reports terminal', async t => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'cta-qoder-alias-')));
+  t.after(() => rm(home, { recursive: true, force: true }).catch(() => {}));
+  const terminal = status => ['completed', 'failed', 'cancelled', 'blocked'].includes(status);
+  const store = new ReceiptStore(join(home, 'qoder-receipts'), { isTerminal: terminal });
+  await store.open();
+  const original = '00000000-0000-4000-8000-000000000101';
+  const follow = '00000000-0000-4000-8000-000000000102';
+  await store.commit({
+    order_id: original, status: 'completed', conversation_id: 'session-a', native_session_id: 'session-a',
+    directory: home, permission: 'accept_edits', started_at: '2026-01-01T00:00:00.000Z',
+  });
+  const base = {
+    order_id: follow, conversation_id: 'session-a', native_session_id: 'session-a', resume_from: 'session-a',
+    directory: home, permission: 'accept_edits', started_at: '2026-01-02T00:00:00.000Z',
+  };
+  await store.commit({ ...base, status: 'starting' });
+  await store.commit({ ...base, status: 'executing', conversation_id: 'session-b', native_session_id: 'session-b' });
+  await store.commit({ ...base, status: 'completed', conversation_id: 'session-b', native_session_id: 'session-b' });
+
+  const adapter = new Qoder({ home, spawn() { throw new Error('must not spawn'); } });
+  await adapter.open();
+  assert.equal(adapter.store.session('session-a').status, 'completed',
+    'the resumed-from alias follows the order when the follow-up changes native session');
+  assert.equal(adapter.store.session('session-a').native_session_id, 'session-a',
+    'the old alias still identifies the session it was created for');
+  assert.deepEqual(await adapter.cancel('session-a'), {
+    cancelled: false, already_terminal: true, conversation_id: 'session-a', native_queue_cleared: false,
+  });
+  await adapter.close();
+});
+
+test('send observes a terminal save that was queued after an older starting snapshot', async t => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'cta-qoder-save-order-')));
+  t.after(() => rm(home, { recursive: true, force: true }).catch(() => {}));
+  const adapter = new Qoder({ home, spawn() { throw new Error('must not spawn'); } });
+  await adapter.open();
+  const id = '00000000-0000-4000-8000-000000000103';
+  const native = adapter.store.commit.bind(adapter.store);
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  adapter.store.commit = async receipt => {
+    if (receipt.status === 'starting') { entered(); await gate; }
+    return native(receipt);
+  };
+  const receipt = { order_id: id, status: 'starting', conversation_id: 'session', directory: home, text: '', progress: 'starting' };
+  adapter.turns.set(id, receipt);
+  const initialSave = adapter.save(receipt);
+  await started;
+  receipt.status = 'completed';
+  receipt.progress = 'done';
+  receipt.output = { text: 'native result', terminal_confirmed: true, exit_confirmed: true };
+  const record = { receipt, exited: true, child: {}, timers: {} };
+  adapter.processes.set(id, record);
+  adapter.releaseProcess(record);
+  adapter.persist(receipt);
+  releaseGate();
+  await initialSave;
+
+  const result = await adapter.send({ id }, { conversation_id: 'session' }, 'unused', 'queue');
+  assert.equal(result.status, 'completed');
+  assert.equal(result.output.text, 'native result');
+  await adapter.close();
 });

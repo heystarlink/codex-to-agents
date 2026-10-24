@@ -27,6 +27,9 @@ async function environment(t) {
     async checkpoint(id) { return { conversation_id: id, checkpoint: 1 }; },
     async progress() { counters.progress++;return { status: 'executing', progress: 'waiting' }; },
     async cancel(id) { operations.push({ cancelled: id }); },
+    // A native session is ready for a follow-up unless a running sibling still
+    // owns it. Tests override this to model a busy adapter.
+    async ready() { return true; },
   };
   const consumers = [];
   const consumer = async (options = {}) => {
@@ -242,6 +245,67 @@ test('polling slows down when no work is unfinished', async t => {
   await delay(350);
   const idle = f.counters.observe - before;
   assert.ok(idle <= 1, `idle polling must be cheaper, saw ${idle} passes in 350 ms`);
+});
+
+test('changing progress of an executing order never spins the consumer into immediate ticks', async t => {
+  const f = await environment(t);
+  const order = await f.book.submit('work_submit', { goal: 'streaming progress' });
+  await f.book.transition(order.order_id, 'executing', { conversation_id: 'cw-stream', progress: 'step 0' });
+  let progress = 0;
+  // The native side reports a new progress text on every observation, exactly
+  // like a streaming reply. Each change is written back to the work order.
+  f.desktop.progress = async () => ({ status: 'executing', progress: `step ${++progress}` });
+  const worker = await f.consumer({ activeInterval: 750, idleInterval: 750, heartbeatInterval: 2000 });
+  worker.start({ activeInterval: 750, idleInterval: 750, heartbeatInterval: 2000 });
+  await waitFor(() => progress >= 1, 2000, 'first active pass');
+  const first = f.counters.observe;
+  await delay(1200);
+  const passes = f.counters.observe - first;
+  assert.ok(passes >= 1, `active polling must still follow running work, saw ${passes} passes`);
+  assert.ok(passes <= 3, `changing progress must not trigger immediate ticks, saw ${passes} passes in 1.2 s`);
+  assert.ok(progress > passes, 'the progress text really changed while the window was open');
+});
+
+test('a queued follow-up blocked by a running session does not spin and resumes when it finishes', async t => {
+  const f = await environment(t);
+  const blocker = await f.book.submit('work_submit', { goal: 'running session' });
+  await f.book.transition(blocker.order_id, 'executing', { conversation_id: 'cw-shared', progress: 'step 0' });
+  const followUp = await f.book.submit('work_update', { target_order: blocker.order_id, action: 'append', message: 'after it finishes' });
+  let progress = 0;
+  f.desktop.progress = async () => ({ status: 'executing', progress: `step ${++progress}` });
+  // A long active interval proves the wake-ups, not polling, decide delivery.
+  const worker = await f.consumer({ activeInterval: 5000, idleInterval: 5000, heartbeatInterval: 2000 });
+  worker.start({ activeInterval: 5000, idleInterval: 5000, heartbeatInterval: 2000 });
+  await waitFor(() => progress >= 1, 2000, 'initial pass');
+  const first = f.counters.observe;
+  await delay(700);
+  const passes = f.counters.observe - first;
+  assert.ok(passes <= 1, `a blocked follow-up must not force immediate ticks, saw ${passes} passes`);
+  assert.ok(!f.sent.some(item => item.id === followUp.order_id), 'the follow-up waits for the blocking session');
+
+  const started = Date.now();
+  await f.book.transition(blocker.order_id, 'completed', { output: { text: 'native result' } });
+  await waitFor(() => f.sent.some(item => item.id === followUp.order_id), 1000, 'follow-up after the blocker');
+  assert.ok(Date.now() - started < 1000, 'a terminal change must unblock the queued follow-up immediately');
+  assert.equal(f.sent.filter(item => item.id === followUp.order_id).length, 1, 'the follow-up is delivered once');
+});
+
+test('status changes of another executor never wake this consumer', async t => {
+  const f = await environment(t);
+  const worker = await f.consumer({ activeInterval: 5000, idleInterval: 5000, heartbeatInterval: 2000 });
+  worker.start({ activeInterval: 5000, idleInterval: 5000, heartbeatInterval: 2000 });
+  await delay(120);
+  const first = f.counters.observe;
+  // Hermes work shares the index but belongs to a different consumer. Even
+  // eight complete submit/transition cycles must not schedule a DSH tick.
+  for (let index = 0; index < 8; index++) {
+    const order = await f.book.submit('work_submit', { executor: 'hermes', goal: `hermes ${index}` });
+    await f.book.transition(order.order_id, 'completed', { output: { text: 'done' } });
+  }
+  await delay(480);
+  const passes = f.counters.observe - first;
+  assert.equal(passes, 0, `another executor's status changes must not tick this consumer, saw ${passes}`);
+  assert.equal(f.sent.length, 0, 'this consumer never delivers another executor work');
 });
 
 test('an uncertain order is followed without a replay and can still finish', async t => {

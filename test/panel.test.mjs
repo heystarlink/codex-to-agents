@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, readdir, writeFile, access, mkdir, realpath } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, readdir, writeFile, access, mkdir, chmod, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -408,6 +408,65 @@ test('panel refresh targets the stored or selected executor and returns without 
   assert.deepEqual(refreshed, ['dsh', 'hermes', 'qoder']);
   assert.equal(healthChecks, 4);
   assert.equal((await new OrderBook(home).list()).length, 0);
+});
+
+test('the panel default snapshot exposes settings only and never reads work-order history', async t => {
+  const home = await fixture(t);
+  const book = new OrderBook(home);await book.open();
+  const marker = 'ORDER-BODY-MARKER';
+  const order = await book.submit('work_submit', { goal: `${marker} goal`, title: `${marker} title` });
+  await book.transition(order.order_id, 'executing', {
+    conversation_id: 'cw-marker', progress: marker, output: { text: marker },
+  });
+  const damaged = await book.submit('work_submit', { goal: 'damaged history' });
+  await writeFile(join(home, 'states', `${damaged.order_id}.json`), '{broken');
+  await writeFile(join(home, 'requests', `${damaged.order_id}.json`), '{broken');
+  await saveDelegation(home, { enabled: true, executor: 'dsh' });
+  const catalog = { models: [{ provider: 'account', model: 'flash', name: 'Flash' }] };
+  await book.runtime({ active: true, protocol: 2, at: new Date().toISOString(), catalog });
+
+  // No snapshot override: this is exactly the default entry the board uses.
+  const server = new McpServer({ name: 'panel-settings-contract', version: '1.0' });
+  registerPanel(server, home);
+  const client = new Client({ name: 'panel-settings-contract', version: '1.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  t.after(async () => { await client.close();await server.close(); });
+  await server.connect(a);await client.connect(b);
+  const snapshot = async () => client.callTool({ name: 'panel_snapshot', arguments: {} });
+  const allowed = ['delegation', 'generated_at', 'service', 'usage', 'warnings', 'worker'];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await snapshot();
+    assert.equal(response.isError, undefined);
+    const value = response.structuredContent;
+    assert.deepEqual(Object.keys(value).sort(), allowed, 'settings carry no work orders, agents or summaries');
+    assert.ok(!JSON.stringify(value).includes(marker), 'the settings snapshot never contains a work-order body');
+    assert.deepEqual(value.warnings, [], 'a damaged history must not even produce settings warnings');
+    assert.equal(value.delegation.executor, 'dsh');
+    assert.deepEqual(value.worker.executors.dsh.models, catalog.models, 'the live model catalog stays available');
+  }
+  // Everything the shared settings page writes still works.
+  const saved = await client.callTool({ name: 'panel_settings', arguments: { enabled: false, executor: 'qoder' } });
+  assert.equal(saved.isError, undefined);
+  assert.equal((await snapshot()).structuredContent.delegation.executor, 'qoder');
+
+  // Unreadable work-order directories prove the snapshot takes no history
+  // dependency at all: a reader would now fail or report a work-order warning.
+  await chmod(join(home, 'requests'), 0o000);
+  await chmod(join(home, 'states'), 0o000);
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const value = (await snapshot()).structuredContent;
+      assert.deepEqual(Object.keys(value).sort(), allowed);
+      assert.deepEqual(value.warnings, []);
+      assert.equal(value.delegation.executor, 'qoder');
+      assert.ok(!JSON.stringify(value).includes(marker));
+    }
+  } finally {
+    await chmod(join(home, 'requests'), 0o700);
+    await chmod(join(home, 'states'), 0o700);
+  }
+  assert.equal((await book.inspect(order.order_id)).status, 'executing', 'the snapshot never mutates or discards saved work');
 });
 
 test('real panel MCP exposes sidebar/resource and app-only settings, persists across connections, and never publishes orders', async t => {

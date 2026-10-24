@@ -5,10 +5,11 @@ import { OrderBook, definitions, inspectOrderId } from './orders.mjs';
 import { EXECUTORS } from './executors.mjs';
 import { readDelegation, assertPermissionDispatchable } from './delegation.mjs';
 import { registerSddTask } from './sdd-tools.mjs';
+import { createRecentOrderReader } from './recent-orders.mjs';
 
 const response = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value });
 
-export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings, onPanel, onUsage } = {}) {
+export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, snapshot, onSettings, onPanel, onUsage, recentOrders } = {}) {
   const book = new OrderBook(home);
   await book.open();
   const server = new McpServer({ name: 'codex-to-agents', version: '0.1.0' });
@@ -16,6 +17,20 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
     const { registerPanel } = await import('./panel.mjs');
     registerPanel(server, home, { snapshot, onSettings, onRuntime, onPanel, onUsage });
     return server;
+  }
+  const listing = recentOrders ?? createRecentOrderReader(home);
+  if (!recentOrders) {
+    // The protocol callback covers peer/transport disconnects; explicit close
+    // also awaits cleanup when no transport has ever been connected.
+    const onclose = server.server.onclose;
+    server.server.onclose = () => {
+      onclose?.();
+      void listing.close().catch(error => console.error(error.message));
+    };
+    const close = server.close.bind(server);
+    server.close = async () => {
+      try { await close(); } finally { await listing.close(); }
+    };
   }
   for (const [kind, definition] of Object.entries(definitions)) {
     server.registerTool(kind, {
@@ -51,11 +66,7 @@ export async function createMcp(home, { panelOnly = false, onOrder, onRuntime, s
         const state = await book.inspect(order_id);
         return response({ ...state, worker: await book.runtime(null, state.executor) });
       }
-      const orders = await book.list();
-      return response({ total: orders.length, orders: orders.slice(-limit).reverse().map(item => ({
-        order_id: item.order_id, executor: item.executor, kind: item.kind, status: item.status, conversation_id: item.conversation_id ?? null,
-        progress: item.progress?.slice(-250) ?? '', created_at: item.created_at,
-      })), worker: await book.runtimes() });
+      return response(await listing.list(limit));
     } catch (error) { return { isError: true, content: [{ type: 'text', text: error.message }] }; }
   });
   server.registerTool('runtime_info', {
