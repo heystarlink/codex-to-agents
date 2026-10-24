@@ -44,6 +44,7 @@ async function probe(mode) {
     const { InMemoryTransport } = await import(require.resolve('@modelcontextprotocol/sdk/inMemory.js'));
     const { StreamableHTTPClientTransport } = await import(require.resolve('@modelcontextprotocol/sdk/client/streamableHttp.js'));
     home = await fsp.mkdtemp(join(tmpdir(), 'cta-recent-'));
+    await fsp.writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\\n');
     const book = new OrderBook(home);await book.open();
     let server;let backend;const clients = [];
     try {

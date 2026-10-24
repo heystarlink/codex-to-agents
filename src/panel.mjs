@@ -94,7 +94,7 @@ export function registerPanel(server, home, { snapshot = () => settingsSnapshot(
   }
   server.registerTool('panel_usage', {
     title: '匿名使用统计',
-    description: 'Save the anonymous usage-statistics consent selected by the user in the Agents board. Disabled by default. Accepts only enabled; does not change delegation or SDD. App-only.',
+    description: 'Save the anonymous usage-statistics consent selected by the user in the Agents board. Enabled by default when no saved choice exists. Accepts only enabled; does not change delegation or SDD. App-only.',
     inputSchema: z.object({ enabled: z.boolean() }).strict(),
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     _meta: { ui: { resourceUri: PANEL_URI, visibility: ['app'] } },

@@ -29,15 +29,57 @@ async function linked(t, home, panelOnly) {
   return client;
 }
 
-test('default OFF: status and activity create neither files nor IDs and send nothing', async t => {
+test('default ON: status stays read-only and activity sends one allowlisted report', async t => {
   const root = await fixture(t);const home = join(root, 'absent');
-  let requests = 0;
-  const reporter = createUsageReporter(home, { version, fetchImpl: async () => { requests++;return success(); } });
+  const requests = [];
+  const reporter = createUsageReporter(home, { now: () => Date.parse('2026-10-23T12:00:00Z'), version,
+    fetchImpl: async (url, init) => { requests.push({ url, init });return success(); } });
   t.after(() => reporter.close());
-  assert.deepEqual(await usageStatus(home), { enabled: false, last_sent_day: null });
+  assert.deepEqual(await usageStatus(home), { enabled: true, last_sent_day: null });
+  await assert.rejects(access(home), { code: 'ENOENT' }, 'a status read never creates the data directory');
+  await reporter.activity();
+  assert.equal(requests.length, 1);
+  const saved = await readState(home);
+  assert.match(saved.installation_id, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  assert.equal(saved.last_sent_day, '2026-10-23');
+  assert.deepEqual(JSON.parse(requests[0].init.body), { installation_id: saved.installation_id, version: '0.1.0' });
+  assert.deepEqual(Object.keys(JSON.parse(requests[0].init.body)).sort(), ['installation_id', 'version']);
+  assert.deepEqual(await usageStatus(home), { enabled: true, last_sent_day: '2026-10-23' });
+  assert.deepEqual(await readdir(home), ['usage-state.json'], 'the missing preference is never rewritten');
+});
+
+test('saved OFF stays effective across a reporter restart without an ID or request', async t => {
+  const home = await fixture(t);await saveUsageSetting(home, false);
+  let requests = 0;
+  const options = { now: () => Date.parse('2026-10-23T12:00:00Z'), version,
+    fetchImpl: async () => { requests++;return success(); } };
+  let reporter = createUsageReporter(home, options);
+  await reporter.activity();reporter.close();
+  reporter = createUsageReporter(home, options);t.after(() => reporter.close());
   await reporter.activity();
   assert.equal(requests, 0);
-  await assert.rejects(access(home), { code: 'ENOENT' });
+  assert.deepEqual(await usageStatus(home), { enabled: false, last_sent_day: null });
+  assert.deepEqual(JSON.parse(await readFile(join(home, 'usage-settings.json'), 'utf8')), { enabled: false });
+  await assert.rejects(access(join(home, 'usage-state.json')), { code: 'ENOENT' });
+});
+
+test('saved OFF keeps restarted shared backends silent', async t => {
+  const home = await fixture(t);await saveUsageSetting(home, false);
+  let requests = 0;
+  const usageOptions = { version, fetchImpl: async () => { requests++;return success(); } };
+  const connectAndInspect = async () => {
+    const backend = await startBackend(home, { usageOptions });
+    const client = new Client({ name: 'usage-off-backend', version: '1.0' });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(backend.url + '/mcp'), { requestInit: { headers: await backendAuth(home) } }));
+      await client.callTool({ name: 'work_inspect', arguments: {} });
+      await delay(50);
+    } finally { await client.close();await backend.close(); }
+  };
+  await connectAndInspect();await connectAndInspect();
+  assert.equal(requests, 0);
+  assert.deepEqual(await usageStatus(home), { enabled: false, last_sent_day: null });
+  await assert.rejects(access(join(home, 'usage-state.json')), { code: 'ENOENT' });
 });
 
 test('concurrent sessions, restart and UTC rollover share one persistent private ID', async t => {
@@ -179,7 +221,7 @@ test('consent tool is app-only, boolean-only and cannot override destination or 
   for (const input of [{}, { enabled: 'true' }, { enabled: true, endpoint: 'https://evil.example' }, { enabled: true, installation_id: 'secret' }]) {
     assert.equal((await call(input)).isError, true);
   }
-  assert.equal((await usageStatus(home)).enabled, false);
+  assert.equal((await usageStatus(home)).enabled, true, 'invalid app-only calls leave the default choice untouched');
   assert.equal((await call({ enabled: true })).structuredContent.enabled, true);
   assert.equal((await call({ enabled: false })).structuredContent.enabled, false);
   assert.ok(!(await readdir(home)).includes('usage-state.json'), 'saving preference alone never creates an ID');

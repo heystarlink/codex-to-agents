@@ -193,9 +193,9 @@ function renderUsage() {
   $('usage-message').textContent = usageSetting.error
     ?? (!window.agentsHost ? '请在 Codex 的 Agents 看板中设置统计开关。'
       : !usageSupported ? '当前后台尚未提供统计设置，请重启插件后台并重新打开看板。'
-      : !usageSetting.enabled ? '默认关闭，由你决定是否开启。'
+      : !usageSetting.enabled ? '已关闭，不会发送后续统计；可随时重新开启。'
       : (usageSetting.last_sent_day ? `上次成功上报：${usageSetting.last_sent_day}（UTC）。` : '已开启，使用插件时上报。')
-        + ' 每个 UTC 日最多尝试一次，失败当天不重试；关闭后停止后续上报。');
+        + ' 每个 UTC 日最多尝试一次，失败当天不重试；可随时关闭，关闭后停止后续上报。');
 }
 
 async function saveUsageChoice(enabled) {

@@ -16,6 +16,8 @@ const PLAN = '# 模型完整规划\n\n## 目标\n\n把规划保存到共享文�
 
 test('real MCP stdio exposes exactly seven tools, saves a complete model plan, and supports offline orders', async () => {
   const home = await mkdtemp('/tmp/cw-mcp-');
+  // The shared backend must not send production usage statistics from tests.
+  await writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\n');
   const client = new Client({ name: 'codex-to-agents-test', version: '1.0' });
   try {
     await client.connect(new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('../src/command.mjs', import.meta.url)), 'serve', '--home', home], stderr: 'pipe' }));
@@ -43,6 +45,7 @@ test('real MCP stdio exposes exactly seven tools, saves a complete model plan, a
 
 test('real MCP stdio documents order_id generation and rejects malformed IDs before any work is saved', async () => {
   const home = await mkdtemp('/tmp/cw-mcp-id-');
+  await writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\n');
   const client = new Client({ name: 'codex-to-agents-id-test', version: '1.0' });
   const call = async (name, args) => {
     try { return await client.callTool({ name, arguments: args }); }

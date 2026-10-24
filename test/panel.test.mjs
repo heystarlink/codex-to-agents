@@ -471,6 +471,9 @@ test('the panel default snapshot exposes settings only and never reads work-orde
 
 test('real panel MCP exposes sidebar/resource and app-only settings, persists across connections, and never publishes orders', async t => {
   const home = await fixture(t);
+  // This test reaches the shared backend over stdio; keep it off the production
+  // statistics endpoint.
+  await writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\n');
   const connect = async () => {
     const client = new Client({ name: 'panel-test', version: '1.0' });
     await client.connect(new StdioClientTransport({ command: await namedNode(home, 'agents-board'), args: [entry, 'serve', '--panel-only', '--home', home], stderr: 'pipe' }));
@@ -491,6 +494,9 @@ test('real panel MCP exposes sidebar/resource and app-only settings, persists ac
   assert.equal(contents[0].mimeType, 'text/html;profile=mcp-app');
   assert.equal(contents[0]._meta['openai/ui'].preferredDisplayMode, 'fullscreen');
   assert.match(contents[0].text, /ui\/initialize/);assert.match(contents[0].text, /自动派工/);
+  assert.match(contents[0].text, /未保存过选择时默认开启，可随时关闭/);
+  assert.doesNotMatch(contents[0].text, /默认关闭，由你决定是否开启/);
+  assert.match(contents[0].text, /id="usage-message"[^>]*>正在读取统计设置/);
   assert.match(contents[0].text, /id="delegation-model"/);
   assert.match(contents[0].text, /id="delegation-effort"/);
   assert.match(contents[0].text, /id="delegation-permission"/);

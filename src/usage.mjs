@@ -24,7 +24,9 @@ async function writeJson(home, file, value) {
 
 async function readSettings(home) {
   const value = await readJson(join(home, SETTINGS));
-  if (value === undefined) return { enabled: false };
+  // An absent file means the user has never chosen. Default to enabled, but
+  // never rewrite the missing file: an explicit saved false must stay false.
+  if (value === undefined) return { enabled: true };
   if (!value || typeof value.enabled !== 'boolean' || Object.keys(value).length !== 1) throw new Error('Invalid usage setting.');
   return value;
 }

@@ -32,8 +32,8 @@ async function panelFixture(call, { dailyUpdate = async () => ({ status: 'idle' 
   };
 }
 
-test('usage switch defaults OFF, saves independently, rejects stale snapshots and restores failed saves', async () => {
-  let usage = { enabled: false, last_sent_day: null };let rejectSave = false;let delayNext = false;let delayed;
+test('usage switch shows the saved choice, saves independently, rejects stale snapshots and restores failed saves', async () => {
+  let usage = { enabled: true, last_sent_day: null };let rejectSave = false;let delayNext = false;let delayed;
   const calls = [];
   const { $, poll } = await panelFixture(async (name, input) => {
     if (name === 'panel_usage') {
@@ -46,18 +46,23 @@ test('usage switch defaults OFF, saves independently, rejects stale snapshots an
     if (delayNext) { delayNext = false;return new Promise(resolve => { delayed = () => resolve(view); }); }
     return view;
   });
-  assert.equal($('usage-switch').checked, false);assert.equal($('usage-switch').disabled, false);
-  $('usage-switch').checked = true;$('usage-switch').change();await settle();
-  assert.deepEqual(calls, [{ enabled: true }]);
+  assert.equal($('usage-switch').checked, true);assert.equal($('usage-switch').disabled, false);
   assert.equal($('usage-state').textContent, '已开启');
+  assert.match($('usage-message').textContent, /已开启，使用插件时上报/);
+  assert.doesNotMatch($('usage-message').textContent, /默认关闭/);
+  $('usage-switch').checked = false;$('usage-switch').change();await settle();
+  assert.deepEqual(calls, [{ enabled: false }]);
+  assert.equal($('usage-state').textContent, '已关闭');
+  assert.match($('usage-message').textContent, /已关闭.*可随时重新开启/);
+  assert.doesNotMatch($('usage-message').textContent, /默认关闭/);
   assert.equal($('delegation-switch').checked, false, 'usage consent cannot enable delegation');
   delayNext = true;await poll();
-  $('usage-switch').checked = false;$('usage-switch').change();await settle();
-  delayed();await settle();
-  assert.equal($('usage-switch').checked, false, 'an old ON snapshot cannot restore consent');
-  rejectSave = true;
   $('usage-switch').checked = true;$('usage-switch').change();await settle();
-  assert.equal($('usage-switch').checked, false);
+  delayed();await settle();
+  assert.equal($('usage-switch').checked, true, 'an old OFF snapshot cannot revert consent');
+  rejectSave = true;
+  $('usage-switch').checked = false;$('usage-switch').change();await settle();
+  assert.equal($('usage-switch').checked, true);
   assert.match($('usage-message').textContent, /保存失败/);
 });
 
@@ -66,6 +71,8 @@ test('old backend leaves usage control disabled with reload guidance', async () 
     delegation: { enabled: false, executor: 'dsh' }, worker: { executors: { dsh: { models: [] } } },
   }));
   assert.equal($('usage-switch').disabled, true);
+  assert.equal($('usage-state').textContent, '已关闭');
+  assert.doesNotMatch($('usage-message').textContent, /已开启/);
   assert.match($('usage-message').textContent, /重启插件后台/);
 });
 

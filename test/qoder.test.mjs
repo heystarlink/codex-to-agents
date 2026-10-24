@@ -437,6 +437,7 @@ test('a hung catalog probe does not block backend health or board reads', async 
   const cli = await createQoderFixture(t, { control: { models_mode: 'hang', modelsHangMs: 30000 } });
   const home = await realpath(await mkdtemp(join(tmpdir(), 'cta-qoder-backend-')));
   const directory = join(home, 'project');await mkdir(directory);
+  await writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\n');
   await writeFile(join(home, 'settings.json'), JSON.stringify({ qoder: { executable: cli.executable, defaultDirectory: directory, catalogTimeoutMs: 700, catalogErrorTtlMs: 100 } }));
   const book = new OrderBook(home);await book.open();
   await book.submit('work_submit', { executor: 'qoder', goal: 'pending qoder work' });

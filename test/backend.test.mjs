@@ -13,6 +13,9 @@ import { OrderBook } from '../src/orders.mjs';
 
 async function fixture(t) {
   const home = await mkdtemp('/tmp/cta-backend-');
+  // Backend tests must never reach the production statistics endpoint now that
+  // an absent preference defaults to enabled.
+  await writeFile(join(home, 'usage-settings.json'), '{"enabled":false}\n');
   t.after(async () => { await stopBackend(home);await rm(home, { recursive: true, force: true }); });
   return home;
 }
